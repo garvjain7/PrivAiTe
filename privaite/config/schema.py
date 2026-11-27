@@ -1,0 +1,601 @@
+from __future__ import annotations
+
+import re
+from typing import Annotated, Literal
+
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+
+# Accelerator selection. An unknown value used to degrade silently: onnxruntime
+# does not fail when an execution provider is missing, it emits a Python
+# UserWarning and builds a CPU session, so `device: "cuda"` on a CPU-only build
+# (or any typo) looked like it worked while every inference ran on the CPU.
+# Refuse the value at boot instead. The message names the accepted forms, never
+# the offending input, so a config error can never echo an interpolated value.
+#
+# The torch-backed detectors (mlmodel, bert_ner, gliner) accept an optional
+# device index ("cuda:1") because torch does. The ONNX runtime selects an
+# execution provider by name, so an index there would silently mean CPU and is
+# refused; "coreml" is the reverse case, an ONNX-only provider name.
+_TORCH_DEVICE_RE = re.compile(r"^(auto|cpu|(cuda|mps)(:\d+)?)$")
+_ONNX_DEVICES = ("auto", "cpu", "cuda", "coreml", "mps")
+
+
+def _check_torch_device(value: str) -> str:
+    if not _TORCH_DEVICE_RE.match(value):
+        raise ValueError("device must be auto, cpu, cuda[:N] or mps[:N]")
+    return value
+
+
+def _check_onnx_device(value: str) -> str:
+    if value not in _ONNX_DEVICES:
+        raise ValueError(f"device must be one of {', '.join(_ONNX_DEVICES)}")
+    return value
+
+
+TorchDevice = Annotated[str, AfterValidator(_check_torch_device)]
+
+
+def _check_disabled_recognizers(value: list[str]) -> list[str]:
+    """A typo here would silently protect nothing.
+
+    Switching a recognizer off is the one knob that widens what reaches the
+    provider, and an unknown name is indistinguishable from a working config at
+    runtime: the operator reads their own YAML as proof the masking is off while
+    it is still on. Refuse it at load time, like every other unsafe config.
+    """
+    from privaite.pii.recognizer_names import BUILTIN_RECOGNIZER_NAMES
+
+    unknown = [name for name in value if name not in BUILTIN_RECOGNIZER_NAMES]
+    if unknown:
+        raise ValueError(
+            f"unknown recognizer(s) {', '.join(sorted(unknown))}. "
+            f"Valid names: {', '.join(sorted(BUILTIN_RECOGNIZER_NAMES))}"
+        )
+    return value
+
+
+DisabledRecognizers = Annotated[list[str], AfterValidator(_check_disabled_recognizers)]
+
+OnnxDevice = Annotated[str, AfterValidator(_check_onnx_device)]
+
+
+class StrictModel(BaseModel):
+    """Base for every config section: an unknown key is a startup error.
+
+    Pydantic ignores unknown keys by default, so a typo such as `block_entites`
+    used to load fine and leave the real `block_entities` gate empty, and a
+    misspelled gateway key left the gateway off. That is exactly the silent
+    degradation invariant #6 forbids: unsafe or misunderstood config must fail
+    at boot, never quietly do something else.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ServerConfig(StrictModel):
+    host: str = "0.0.0.0"
+    port: int = 8400
+    workers: int = 1
+    log_level: str = "info"
+    max_request_bytes: int = 10_000_000
+
+
+class AuthConfig(StrictModel):
+    enabled: bool = True
+
+
+class LiteLLMParams(BaseModel):
+    model: str
+    api_key: str | None = None
+    api_base: str | None = None
+
+    # The ONE deliberately permissive section: these are passed straight to
+    # litellm, whose per-provider parameters (api_version, aws_region_name,
+    # vertex_project, timeouts...) change with every litellm release. Forbidding
+    # unknown keys here would reject valid provider configs.
+    model_config = ConfigDict(extra="allow")
+
+
+# Request fields an operator may not add to forward_params: litellm reads them
+# as call settings, not as provider parameters. A client-sent `api_base` sent
+# the operator's API key to the client's server, and `extra_body` is merged over
+# the anonymized payload (`extra_body.messages` replaced the scrubbed messages).
+_UNFORWARDABLE_PARAMS = frozenset(
+    {
+        "api_base",
+        "api_key",
+        "api_version",
+        "base_url",
+        "custom_llm_provider",
+        "default_headers",
+        "extra_body",
+        "extra_headers",
+        "headers",
+        "model_list",
+        "organization",
+        "user_config",
+    }
+)
+_UNFORWARDABLE_PREFIXES = ("aws_", "azure_", "vertex_")
+
+
+def _check_forward_params(value: list[str]) -> list[str]:
+    refused = sorted(
+        name
+        for name in value
+        if name in _UNFORWARDABLE_PARAMS or name.startswith(_UNFORWARDABLE_PREFIXES)
+    )
+    if refused:
+        raise ValueError(
+            f"forward_params cannot include {', '.join(refused)}: litellm reads it as a "
+            "call setting (endpoint, credentials, or a body merged over the anonymized "
+            "request). Set it in litellm_params instead."
+        )
+    return value
+
+
+ForwardParams = Annotated[list[str], AfterValidator(_check_forward_params)]
+
+
+class ProviderConfig(StrictModel):
+    model_name: str
+    litellm_params: LiteLLMParams
+    # Request fields forwarded to this provider on top of the OpenAI parameters
+    # (top_k for an Ollama model, say). They reach the provider unscanned.
+    forward_params: ForwardParams = Field(default_factory=list)
+
+
+class PresidioDetectorConfig(StrictModel):
+    enabled: bool = True
+    languages: list[str] = Field(default_factory=lambda: ["fr", "en"])
+    score_threshold: float = 0.4
+    entities: list[str] | None = None
+    # Names of the recognizers PrivAiTe registers itself, to switch off. They are
+    # exempt from `entities` on purpose (an allowlist set by a preset must not
+    # silently kill them), so removing a type from that list does NOT disable
+    # them: this is the knob that does. Empty by default, so the secret and
+    # contextual recognizers keep protecting by default.
+    disabled_recognizers: DisabledRecognizers = Field(default_factory=list)
+    # "spacy" loads one spaCy model per language and adds its named entities
+    # (PERSON, LOCATION, ...) to the pattern recognizers. "blank" keeps the
+    # pattern and PrivAiTe recognizers but tokenizes with a blank spaCy pipeline:
+    # no model to install, several times faster on long agent requests, and no
+    # spaCy NER, so names then come from an ML detector only. The ultrafast
+    # preset selects "blank" unless this is set explicitly.
+    nlp_engine: Literal["spacy", "blank"] = "spacy"
+    # Upper bound on what spaCy parses at once. Its memory grows with the
+    # length of the text (its docs: about 1GB per 100,000 characters for the
+    # parser and NER), and an agent request can carry a whole document in one
+    # leaf. Longer text is parsed in consecutive pieces of at most this many
+    # characters and joined back into one Doc, and the recognizers then run
+    # once over the whole text with it: no pattern ever sees a cut, which a
+    # chunked analysis could not promise for a value of unknown length (a key
+    # block, a token) or a string the chunk starts inside of. Only what spaCy
+    # contributes (its entities, and the lemmas context words read) can differ,
+    # in practice next to a cut. None (the default) parses the text whole, as
+    # before.
+    max_chunk_chars: int | None = Field(default=None, ge=1_000)
+
+
+# The openai/privacy-filter model's label set, shared by its ONNX and torch backends.
+_PRIVACY_FILTER_LABELS = {
+    "private_person": "PERSON",
+    "private_email": "EMAIL_ADDRESS",
+    "private_phone": "PHONE_NUMBER",
+    "private_address": "LOCATION",
+    "private_date": "DATE_TIME",
+    "private_url": "URL",
+    "account_number": "FINANCIAL",
+    "secret": "SECRET",
+}
+
+# Immutable Hugging Face commits for the built-in detector models.  Keeping the
+# defaults at commits rather than the moving `main` branch makes fresh installs
+# reproducible.  Operators replacing model_name must set revision to a commit
+# from that model's repository (or explicitly choose a mutable ref).
+_PRIVACY_FILTER_REVISION = "7ffa9a043d54d1be65afb281eddf0ffbe629385b"
+_BERT_NER_REVISION = "d1a3e8f13f8c3566299d95fcfc9a8d2382a9affc"
+_GLINER_PII_REVISION = "1fcf13e85f4eef5394e1fcd406cf2ca9ea82351d"
+_MINILM_REVISION = "e7ea9dd38cd6d03198aeba57174a1d6d3a95618d"
+
+# The PrivAiTe MiniLM model's types under PrivAiTe's names where it has one; the
+# others keep the model's name (the placeholder anonymizer accepts any type).
+_MINILM_LABELS = {
+    "PERSON": "PERSON",
+    "CONTACT": "CONTACT",
+    "ADDRESS": "LOCATION",
+    "LOCATION": "LOCATION",
+    "ORGANIZATION": "ORGANIZATION",
+    "DATE": "DATE_TIME",
+    "DATE_OF_BIRTH": "DATE_TIME",
+    "AGE": "AGE",
+    "DEMOGRAPHIC": "DEMOGRAPHIC",
+    "GOV_ID": "GOV_ID",
+    "FINANCIAL": "FINANCIAL",
+    "NETWORK_ID": "NETWORK_ID",
+    "RECORD_ID": "RECORD_ID",
+    "SECRET": "SECRET",
+    "OTHER": "OTHER",
+}
+
+
+class _PrivacyFilterDetectorConfig(StrictModel):
+    """Shared config for the two openai/privacy-filter backends; they differ only in
+    runtime knobs (ONNX variant vs torch dtype/cache)."""
+
+    enabled: bool = False
+    model_name: str = "openai/privacy-filter"
+    # The built-in model is pinned to an immutable commit. When model_name is
+    # changed, set its matching commit SHA too; None deliberately follows main.
+    revision: str | None = _PRIVACY_FILTER_REVISION
+    # Off by default: a PII proxy must not execute code shipped inside a model repo
+    # unless the operator explicitly opts in for a custom-code model.
+    trust_remote_code: bool = False
+    device: TorchDevice = "auto"
+    score_threshold: float = 0.5
+    label_mapping: dict[str, str] = Field(default_factory=lambda: dict(_PRIVACY_FILTER_LABELS))
+
+
+class MLModelDetectorConfig(_PrivacyFilterDetectorConfig):
+    torch_dtype: str = "float16"
+    batch_size: int = 1
+
+
+class OnnxDetectorConfig(_PrivacyFilterDetectorConfig):
+    # ONNX picks an execution provider, not a torch device: "coreml" is valid
+    # here (an explicit opt-in, never chosen by "auto") and an index is not.
+    device: OnnxDevice = "auto"
+    # Same 4-bit weights as "q4f16", but computed in fp32: CPUs do not run fp16
+    # natively, and a q4 window measured 1.4x to 1.6x faster with the same
+    # detections. "q4f16" stays the better pick for a GPU session.
+    onnx_variant: str = "q4"
+    max_length: int = 128000
+    cache_dir: str | None = None
+    # Reuse identical ONNX input windows during one scrub call only. Unlike the
+    # opt-in detection_cache, nothing survives the request (including on error).
+    deduplicate_windows: bool = True
+
+
+class MiniLMDetectorConfig(StrictModel):
+    """PrivAiTe's own multilingual PII model (MiniLM L12, 117M parameters, 15
+    types), trained for this proxy. Off by default; the minilm and ultrafast
+    presets turn it on. Its model card lists the data, licenses and scores."""
+
+    enabled: bool = False
+    model_name: str = "crp4222/privaite-pii-minilm"
+    # The built-in model is pinned to an immutable commit; None follows main.
+    revision: str | None = _MINILM_REVISION
+    # "onnx" is the fp32 export, span-identical to the trained model; "onnx_int8"
+    # is 4x smaller and about twice as fast on CPU for a point of recall or less;
+    # "coreml" runs on the Apple Neural Engine (macOS, pip install
+    # 'privaite[ane]'), about 4x faster again. The ultrafast preset selects
+    # "coreml" unless this is set explicitly.
+    backend: Literal["onnx", "onnx_int8", "coreml"] = "onnx"
+    # The model was trained and evaluated with argmax decoding, no threshold.
+    # Raise it to trade recall for precision.
+    score_threshold: float = 0.0
+    # Map each model type to the entity type it is masked as. A type left out of
+    # the mapping is not masked by this detector.
+    label_mapping: dict[str, str] = Field(default_factory=lambda: dict(_MINILM_LABELS))
+    cache_dir: str | None = None
+    # Reuse identical input windows during one scrub call only (same as onnx).
+    deduplicate_windows: bool = True
+
+
+class BertNERDetectorConfig(StrictModel):
+    enabled: bool = False
+    model_name: str = "dslim/bert-base-NER"
+    # The built-in model is pinned to an immutable commit; None follows main.
+    revision: str | None = _BERT_NER_REVISION
+    device: TorchDevice = "auto"
+    score_threshold: float = 0.5
+    label_mapping: dict[str, str] = Field(
+        default_factory=lambda: {
+            "PER": "PERSON",
+            "LOC": "LOCATION",
+            "ORG": "ORGANIZATION",
+        }
+    )
+
+
+class GlinerDetectorConfig(StrictModel):
+    enabled: bool = False
+    # GLiNER trained on independent (non-AI4Privacy) synthetic data. Adding it to
+    # the onnx suite (the `max` preset) raises out-of-distribution recall; see the
+    # OOD cross-check in privaite-bench. Needs torch + the gliner package
+    # (pip install 'privaite[gliner]'); it is not part of the onnxruntime floor.
+    model_name: str = "urchade/gliner_multi_pii-v1"
+    # The built-in model is pinned to an immutable commit; None follows main.
+    revision: str | None = _GLINER_PII_REVISION
+    device: TorchDevice = "auto"
+    score_threshold: float = 0.5
+    # GLiNER is label-conditioned: it only returns the labels asked for here.
+    labels: list[str] = Field(
+        default_factory=lambda: [
+            "person",
+            "first name",
+            "last name",
+            "email",
+            "phone number",
+            "address",
+            "social security number",
+            "iban",
+            "swift bic code",
+            "credit card number",
+            "date of birth",
+            "password",
+            "ip address",
+            "passport number",
+        ]
+    )
+    # Map each requested GLiNER label to a canonical PrivAiTe entity type.
+    label_mapping: dict[str, str] = Field(
+        default_factory=lambda: {
+            "person": "PERSON",
+            "first name": "PERSON",
+            "last name": "PERSON",
+            "email": "EMAIL_ADDRESS",
+            "phone number": "PHONE_NUMBER",
+            "address": "LOCATION",
+            "social security number": "US_SSN",
+            "iban": "IBAN_CODE",
+            "swift bic code": "FINANCIAL",
+            "credit card number": "CREDIT_CARD",
+            "date of birth": "DATE_TIME",
+            "password": "SECRET",
+            "ip address": "IP_ADDRESS",
+            "passport number": "US_PASSPORT",
+        }
+    )
+
+
+class DetectorsConfig(StrictModel):
+    presidio: PresidioDetectorConfig = Field(default_factory=PresidioDetectorConfig)
+    mlmodel: MLModelDetectorConfig = Field(default_factory=MLModelDetectorConfig)
+    onnx: OnnxDetectorConfig = Field(default_factory=OnnxDetectorConfig)
+    minilm: MiniLMDetectorConfig = Field(default_factory=MiniLMDetectorConfig)
+    bert_ner: BertNERDetectorConfig = Field(default_factory=BertNERDetectorConfig)
+    gliner: GlinerDetectorConfig = Field(default_factory=GlinerDetectorConfig)
+
+
+class EntityOverride(StrictModel):
+    method: str = "placeholder"
+    masking_char: str = "*"
+
+
+class AnonymizationConfig(StrictModel):
+    method: str = "placeholder"
+    faker_locale: list[str] = Field(default_factory=lambda: ["fr_FR", "en_US"])
+    entity_overrides: dict[str, EntityOverride] = Field(default_factory=dict)
+
+
+class DeanonymizationConfig(StrictModel):
+    enabled: bool = True
+    # Fuzzy matching catches placeholders the model re-typed imperfectly, at the
+    # cost of a small wrong-substitution risk on lookalike spans, so it is opt-in.
+    fuzzy_matching: bool = False
+    fuzzy_threshold: float = 0.85
+
+
+class DetectionCacheConfig(StrictModel):
+    # Engine-level cache of merged detection results, keyed on the exact leaf
+    # text. Agent CLIs (Claude Code, Codex) resend the whole conversation every
+    # turn, so without it the proxy re-scans mostly identical bytes: O(n^2)
+    # detector work per session. The cache stores span METADATA only (salted
+    # text hashes, offsets, entity types, scores, sources): never the text,
+    # never the matched values, never the anonymized output. The block_entities
+    # gate still runs on every request, cached or not.
+    #
+    # Off by default (invariant #7: defaults are the safety posture). Enabling
+    # it means PII-derived metadata survives in process memory up to
+    # ttl_seconds after a request ends, instead of nothing outliving the
+    # request. An expired entry can never be served again; it is removed from
+    # memory on the first cache write after its expiry, and the engine clears
+    # the whole cache at shutdown, so only a process that goes completely idle
+    # holds its last (expired, unusable) entries longer, until that next write
+    # or shutdown. See the README threat model before enabling in multi-user
+    # deployments (dedup timing side channel across auth keys).
+    enabled: bool = False
+    max_entries: int = Field(default=4096, ge=1)
+    # 30 minutes: long enough to span an agent session's think time between
+    # turns, short enough that the metadata does not linger for hours.
+    ttl_seconds: int = Field(default=1800, ge=1)
+
+
+class InspectConfig(StrictModel):
+    # Dry-run inspection endpoint (POST /v1/pii/inspect): returns the detections
+    # for a caller-supplied text WITHOUT forwarding anything to any provider and
+    # without logging any value. The caller already knows the text it sent, so
+    # echoing its own detections back leaks nothing; it exists so operators can
+    # verify what gets redacted before trusting the proxy. Off by default.
+    enabled: bool = False
+
+
+class CustomPatternConfig(StrictModel):
+    pattern: str
+    entity_type: str
+    score: float = 0.9
+
+
+class AllowListEntry(StrictModel):
+    """One value-level exemption (pii.allow_list): a detection whose whole text
+    is `value`, or matches `pattern` in full, is forwarded unredacted.
+    `entity_types` limits the entry to those types; without it the entry never
+    applies to SECRET or to a type in block_entities. The checks live in
+    privaite/pii/allow_list.py next to the rule they protect."""
+
+    value: str | None = None
+    pattern: str | None = None
+    entity_types: list[str] | None = None
+
+    @model_validator(mode="after")
+    def _check(self) -> AllowListEntry:
+        from privaite.pii.allow_list import check_entry
+
+        check_entry(self.value, self.pattern, self.entity_types)
+        return self
+
+
+class PassthroughConfig(StrictModel):
+    system_messages: bool = False
+    tool_calls: bool = False
+
+
+# Presidio entity allowlist for the onnx/max presets: the checksummed/structured
+# types Presidio is strong at, leaving names/addresses/secrets to the ML model.
+_ONNX_PRESIDIO_ENTITIES = [
+    "PERSON",
+    "EMAIL_ADDRESS",
+    "PHONE_NUMBER",
+    "CREDIT_CARD",
+    "IBAN_CODE",
+    "IP_ADDRESS",
+    "DATE_TIME",
+    "US_SSN",
+    "UK_NHS",
+]
+
+
+class PIIConfig(StrictModel):
+    enabled: bool = True
+    # Default to the full ONNX suite (72.7% of direct identifiers on the README
+    # benchmark, 196 ms per document): it detects everything the light preset
+    # does plus secrets and passwords. preset: "light" is the fast Presidio-only
+    # path (44.8%, 60 ms); preset: null drives detectors by hand. Do NOT also pin
+    # detectors.presidio.entities to a short allowlist on the light path: that
+    # restricts it to those types only.
+    preset: str | None = "onnx"
+    detectors: DetectorsConfig = Field(default_factory=DetectorsConfig)
+    custom_patterns: list[CustomPatternConfig] = Field(default_factory=list)
+    # Strings that only look like PII (OpenSSH algorithm names read as e-mail
+    # addresses). Empty by default: nothing is let through unless listed.
+    allow_list: list[AllowListEntry] = Field(default_factory=list)
+    merge_strategy: str = "union"
+    overlap_resolution: str = "highest_score"
+    # Fail closed by default: if anonymization raises, block the request rather
+    # than forward raw PII. Only the explicit opt-out "allow" forwards on error.
+    on_error: Literal["block", "allow"] = "block"
+    # Hard policy gate: entity TYPES listed here cause the WHOLE request to be
+    # rejected (HTTP 400) instead of pseudonymized — nothing is forwarded to the
+    # provider. Empty by default, so the default behavior is unchanged (all
+    # detected PII is masked with a placeholder). Opt-in per type, e.g.
+    # ["US_SSN", "CREDIT_CARD"]; everything not listed is still masked as usual.
+    block_entities: list[str] = Field(default_factory=list)
+    strict: bool = False
+    anonymization: AnonymizationConfig = Field(default_factory=AnonymizationConfig)
+    deanonymization: DeanonymizationConfig = Field(default_factory=DeanonymizationConfig)
+    passthrough: PassthroughConfig = Field(default_factory=PassthroughConfig)
+    inspect: InspectConfig = Field(default_factory=InspectConfig)
+    detection_cache: DetectionCacheConfig = Field(default_factory=DetectionCacheConfig)
+    # How many texts may be run through the detectors at once, across
+    # concurrent requests. Each detection holds its detectors' working memory
+    # (an ONNX run over a long text, a spaCy parse), so peak memory is the
+    # models plus about this many detections. An agent CLI sends several
+    # requests together that carry the same new message (count_tokens
+    # alongside messages): a request that waited here looks in the detection
+    # cache again, so the burst costs one detection. A text already in the
+    # cache never waits. None (the default) does not limit.
+    max_concurrent_detections: int | None = Field(default=None, ge=1)
+
+    def model_post_init(self, __context: object) -> None:
+        if self.preset is None:
+            return
+        if self.preset == "light":
+            self.detectors.presidio.enabled = True
+            self.detectors.bert_ner.enabled = False
+            self.detectors.mlmodel.enabled = False
+            self.detectors.onnx.enabled = False
+        elif self.preset == "standard":
+            self.detectors.presidio.enabled = True
+            self.detectors.bert_ner.enabled = True
+            self.detectors.mlmodel.enabled = False
+            self.detectors.onnx.enabled = False
+        elif self.preset == "full":
+            self.detectors.presidio.enabled = True
+            self.detectors.bert_ner.enabled = True
+            self.detectors.mlmodel.enabled = True
+            self.detectors.onnx.enabled = False
+        elif self.preset == "onnx":
+            self.detectors.presidio.enabled = True
+            if not self.detectors.presidio.entities:
+                self.detectors.presidio.entities = list(_ONNX_PRESIDIO_ENTITIES)
+            self.detectors.bert_ner.enabled = False
+            self.detectors.mlmodel.enabled = False
+            self.detectors.onnx.enabled = True
+        elif self.preset == "max":
+            # onnx suite + GLiNER (an independent, non-AI4Privacy model). Higher
+            # out-of-distribution recall at the cost of more false positives and a
+            # torch dependency; opt-in, never the default.
+            self.detectors.presidio.enabled = True
+            if not self.detectors.presidio.entities:
+                self.detectors.presidio.entities = list(_ONNX_PRESIDIO_ENTITIES)
+            self.detectors.bert_ner.enabled = False
+            self.detectors.mlmodel.enabled = False
+            self.detectors.onnx.enabled = True
+            self.detectors.gliner.enabled = True
+        elif self.preset in ("minilm", "ultrafast"):
+            # Opt-in: the onnx suite with PrivAiTe's own MiniLM model in place of
+            # openai/privacy-filter. ultrafast also runs the model on the Apple
+            # Neural Engine and Presidio without spaCy models, for agent CLIs
+            # that resend long conversations every turn. An explicit backend or
+            # nlp_engine in the config wins over the preset.
+            self.detectors.presidio.enabled = True
+            if not self.detectors.presidio.entities:
+                self.detectors.presidio.entities = list(_ONNX_PRESIDIO_ENTITIES)
+            self.detectors.bert_ner.enabled = False
+            self.detectors.mlmodel.enabled = False
+            self.detectors.onnx.enabled = False
+            self.detectors.minilm.enabled = True
+            if self.preset == "ultrafast":
+                if "backend" not in self.detectors.minilm.model_fields_set:
+                    self.detectors.minilm.backend = "coreml"
+                if "nlp_engine" not in self.detectors.presidio.model_fields_set:
+                    self.detectors.presidio.nlp_engine = "blank"
+        else:
+            raise ValueError(
+                f"Unknown PII preset '{self.preset}'. "
+                "Valid presets: light, standard, full, onnx, max, minilm, ultrafast"
+            )
+
+
+class LoggingConfig(StrictModel):
+    format: str = "json"
+    level: str = "info"
+
+
+class GatewayUpstreamConfig(StrictModel):
+    # The provider API root INCLUDING its version prefix; the gateway appends the
+    # protocol's own suffix ("/messages", "/responses"). Codex subscription
+    # traffic is served from https://chatgpt.com/backend-api/codex.
+    base_url: str
+    # Which client request headers to relay upstream. None (the default) is
+    # transparent: every header is forwarded except the ones httpx derives from
+    # the connection (host, content-length, and the encoding/keep-alive set). A
+    # transparent relay is required because some providers select their request
+    # schema from a header, so an allowlist that drops it breaks a valid body.
+    # Set an explicit list only to deliberately restrict what leaves the machine.
+    forward_headers: list[str] | None = None
+
+
+class GatewayConfig(StrictModel):
+    # Opt-in agent-CLI gateway: relays Anthropic Messages and OpenAI Responses
+    # traffic through the same scrub/restore engine. The client authenticates
+    # itself to the upstream with its own token; PrivAiTe neither injects nor
+    # validates credentials on gateway routes. Off by default so nothing about
+    # the proxy changes when disabled.
+    enabled: bool = False
+    anthropic: GatewayUpstreamConfig = Field(
+        default_factory=lambda: GatewayUpstreamConfig(base_url="https://api.anthropic.com/v1")
+    )
+    openai_responses: GatewayUpstreamConfig = Field(
+        default_factory=lambda: GatewayUpstreamConfig(base_url="https://api.openai.com/v1")
+    )
+
+
+class PrivAiTeConfig(StrictModel):
+    server: ServerConfig = Field(default_factory=ServerConfig)
+    auth: AuthConfig = Field(default_factory=AuthConfig)
+    providers: list[ProviderConfig] = Field(default_factory=list)
+    pii: PIIConfig = Field(default_factory=PIIConfig)
+    gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)

@@ -1,0 +1,661 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+import shutil
+from collections.abc import Callable, Sequence
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from privaite.config.schema import OnnxDetectorConfig
+from privaite.pii.boundaries import refine_spans
+from privaite.pii.detector_base import PIIDetector
+from privaite.pii.entity import PIIEntity
+from privaite.pii.window_cache import current_window_cache, inference_request
+
+logger = logging.getLogger("privaite.pii.detector_onnx")
+
+# A full commit hash: a revision that can never point at something else.
+_COMMIT_HASH = re.compile(r"[0-9a-f]{40}")
+
+_ENTITY_ORDER = [
+    "account_number",
+    "private_address",
+    "private_date",
+    "private_email",
+    "private_person",
+    "private_phone",
+    "private_url",
+    "secret",
+]
+_BIOES = ["B", "I", "E", "S"]
+
+ID2LABEL: dict[int, str] = {0: "O"}
+for _i, _ent in enumerate(_ENTITY_ORDER):
+    for _j, _tag in enumerate(_BIOES):
+        ID2LABEL[_i * 4 + _j + 1] = f"{_tag}-{_ent}"
+
+ENTITY_TYPES = [
+    "account_number",
+    "private_address",
+    "private_date",
+    "private_email",
+    "private_person",
+    "private_phone",
+    "private_url",
+    "secret",
+]
+
+# Window geometry for long inputs. A single full-sequence run costs quadratic
+# time and memory (measured on M1 Pro, CPU EP: 2046 tokens 1.5s, 8192 tokens
+# 133s at 8.0GB peak RSS), so no single ONNX run may exceed _WINDOW_TOKENS
+# tokens. Adjacent windows share _WINDOW_OVERLAP tokens of context; each shared
+# token keeps the prediction from the window where it sits furthest from an
+# edge, and BIOES decoding runs once over the stitched sequence (see
+# _stitch_windows). Measured at 1024/128: an 8192-token leaf drops from 154.7s
+# to 6.9s with peak RSS bounded near 2.2GB, and results on real captured
+# payloads are span-identical to full inference.
+_WINDOW_TOKENS = 1024
+_WINDOW_OVERLAP = 128
+
+# Per-window token predictions: (labels, scores, offsets), offsets absolute
+# into the original text (sliced from the full tokenization).
+_WindowTokens = tuple[list[str], list[float], list[tuple[int, int]]]
+
+
+def _window_ranges(token_count: int, window: int, overlap: int) -> list[tuple[int, int]]:
+    if not 0 <= overlap < window:
+        raise ValueError("ONNX window overlap must be smaller than the window")
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    while start < token_count:
+        end = min(start + window, token_count)
+        ranges.append((start, end))
+        if end == token_count:
+            break
+        start += window - overlap
+    return ranges
+
+
+def _check_window_coverage(ranges: list[tuple[int, int]], token_count: int) -> None:
+    """Reject missing source tokens before any detections can be returned."""
+    covered_end = 0
+    for start, end in ranges:
+        if not 0 <= start <= covered_end or not start < end <= token_count:
+            raise RuntimeError("Incomplete ONNX token coverage")
+        covered_end = max(covered_end, end)
+    if covered_end != token_count:
+        raise RuntimeError("Incomplete ONNX token coverage")
+
+
+def _check_text_coverage(
+    offsets: Sequence[tuple[int, int]],
+    text: str,
+    ignorable: Callable[[str], bool] = str.isspace,
+) -> None:
+    """Reject missing text, allowing gaps of ``ignorable`` characters (whitespace
+    by default; a tokenizer that drops other characters passes its own test) and
+    overlapping Unicode offsets."""
+
+    def gap_ok(gap: str) -> bool:
+        return all(ignorable(char) for char in gap)
+
+    previous_start = 0
+    covered_end = 0
+    for start, end in offsets:
+        if not 0 <= start <= end <= len(text):
+            raise RuntimeError("Incomplete ONNX text coverage")
+        if start == end:
+            continue
+        if start < previous_start or end < covered_end:
+            raise RuntimeError("Incomplete ONNX text coverage")
+        if start > covered_end and not gap_ok(text[covered_end:start]):
+            raise RuntimeError("Incomplete ONNX text coverage")
+        previous_start, covered_end = start, end
+    if covered_end < len(text) and not gap_ok(text[covered_end:]):
+        raise RuntimeError("Incomplete ONNX text coverage")
+
+
+def _shared_run_length(
+    prev_offsets: list[tuple[int, int]],
+    cur_offsets: list[tuple[int, int]],
+    expected: int,
+) -> int:
+    """Number of trailing tokens of ``prev_offsets`` that are the same source
+    tokens as the head of ``cur_offsets``. Normally exactly the tokenizer
+    stride, but derived from the offsets themselves so a stride quirk can only
+    cost speed, never alignment (a silent misalignment would duplicate or drop
+    tokens, i.e. duplicate or lose PII spans)."""
+    limit = min(len(prev_offsets), len(cur_offsets))
+    expected = min(expected, limit)
+    if expected and prev_offsets[-expected:] == cur_offsets[:expected]:
+        return expected
+    for run in range(limit, 0, -1):
+        if prev_offsets[-run:] == cur_offsets[:run]:
+            return run
+    return 0
+
+
+def _stitch_windows(rows: list[_WindowTokens], overlap: int) -> _WindowTokens:
+    """Merge per-window token predictions into one global token sequence.
+
+    Each token shared by two windows is kept exactly once: the first half of
+    the shared run from the earlier window, the second half from the later one,
+    so every kept token has at least overlap // 2 tokens of real context on
+    each side (except at the ends of the text, where no more context exists and
+    full inference would see none either). BIOES decoding then runs once over
+    the stitched sequence, so an entity whose B tokens fall in one window and
+    whose E token falls in the next is decoded as one span, never duplicated
+    and never split at the boundary."""
+    if not rows:
+        return [], [], []
+    if len(rows) == 1:
+        return rows[0]
+    shared = [_shared_run_length(rows[r][2], rows[r + 1][2], overlap) for r in range(len(rows) - 1)]
+    labels: list[str] = []
+    scores: list[float] = []
+    offsets: list[tuple[int, int]] = []
+    for r, (row_labels, row_scores, row_offsets) in enumerate(rows):
+        head = shared[r - 1] // 2 if r > 0 else 0
+        tail = len(row_offsets)
+        if r < len(rows) - 1:
+            tail -= shared[r] - shared[r] // 2
+        labels.extend(row_labels[head:tail])
+        scores.extend(row_scores[head:tail])
+        offsets.extend(row_offsets[head:tail])
+    return labels, scores, offsets
+
+
+def _parse_tag(label: str) -> tuple[str, str]:
+    if label == "O":
+        return ("O", "O")
+    prefix, entity = label.split("-", 1)
+    return (prefix, entity)
+
+
+# Model label names, not canonical entity types: decoding runs before
+# `label_mapping` is applied. A path IS the value of a URL, and a secret may be
+# made of any characters at all, so neither may have a leading separator taken
+# off (`boundaries.py` keeps the same rule for the same reason).
+_SEPARATOR_BEARING_LABELS = frozenset({"private_url", "secret"})
+
+
+def _is_word_char(char: str) -> bool:
+    """Letters, digits and underscore: what a word may not be cut inside of.
+
+    Deliberately excludes the hyphen, so extending a truncated span cannot run
+    across a compound and swallow a neighbouring value.
+    """
+    return char.isalnum() or char == "_"
+
+
+def _append_span(
+    spans: list[dict],
+    text: str,
+    entity_type: str,
+    start: int,
+    end: int,
+    score: float,
+    separator_bearing: frozenset[str] = _SEPARATOR_BEARING_LABELS,
+) -> None:
+    """Append one span, snapped to the value it is supposed to cover.
+
+    The tokenizer reports offsets that include the space preceding a word, so a
+    raw span reads `' Marie Dupont'`. Kept as is, the anonymizer swallows the
+    separator (`'I am<PERSON_1>'`) and the restore puts it back INSIDE the
+    value: text comes back with double spaces, and a structured field such as a
+    tool-call argument comes back as `{"to": " marie@..."}`, which the client
+    then sends verbatim. Whitespace is never PII, so trimming here loses
+    nothing and keeps every downstream span honest (the union merge widens
+    overlapping spans, so one padded span would otherwise pad its neighbours).
+
+    A path separator is attached the same way, and a name never starts with
+    one: `/Users/marie-claire` was reported as `'/marie-claire'`, which masks
+    the separator and hands the provider a broken path.
+
+    In that same position the model can tag only the FIRST sub-token of the
+    segment, which is worse than a cosmetic problem: `'/Users/marie'` came back
+    as `'/m'`, so the output read `/Users<PERSON_1>arie` and `arie` reached the
+    provider in clear. Partial masking is a leak, so a span that starts right
+    after a separator is extended to the end of its word. The extension is
+    deliberately limited to that position and stops at any non-word character:
+    elsewhere in a text a short span is the model's answer, not a truncation,
+    and an unbounded extension would swallow whatever run of characters it sits
+    in. A hyphenated segment is therefore only covered up to the hyphen.
+
+    Both only apply to a type whose value cannot itself begin with a separator
+    (see `_SEPARATOR_BEARING_LABELS`), and neither may ever empty a span: a
+    secret that IS a run of slashes would otherwise be dropped here and reach
+    the provider in clear. A model with other label names passes its own set.
+    """
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    if start >= end:
+        # Whitespace only, which is never PII whatever the type.
+        return
+    if entity_type not in separator_bearing:
+        trimmed = start
+        while trimmed < end and text[trimmed] in "/\\":
+            trimmed += 1
+        if trimmed < end:
+            start = trimmed
+        if start > 0 and text[start - 1] in "/\\":
+            while end < len(text) and _is_word_char(text[end]) and _is_word_char(text[end - 1]):
+                end += 1
+    spans.append(
+        {
+            "entity_type": entity_type,
+            "text": text[start:end],
+            "start": start,
+            "end": end,
+            "score": score,
+        }
+    )
+
+
+def decode_bioes_spans(
+    labels: Sequence[str],
+    scores: Sequence[float],
+    offsets: Sequence[tuple[int, int]],
+    text: str,
+    separator_bearing: frozenset[str] = _SEPARATOR_BEARING_LABELS,
+) -> list[dict]:
+    spans: list[dict] = []
+    current_tokens: list[int] = []
+    current_type: str | None = None
+
+    def _flush() -> None:
+        nonlocal current_tokens, current_type
+        if not current_tokens or current_type is None:
+            current_tokens, current_type = [], None
+            return
+        start = offsets[current_tokens[0]][0]
+        end = offsets[current_tokens[-1]][1]
+        avg_score = float(np.mean([scores[i] for i in current_tokens]))
+        _append_span(spans, text, current_type, start, end, avg_score, separator_bearing)
+        current_tokens, current_type = [], None
+
+    for idx, label in enumerate(labels):
+        prefix, etype = _parse_tag(label)
+
+        if prefix == "S":
+            _flush()
+            s, e = offsets[idx][0], offsets[idx][1]
+            _append_span(spans, text, etype, s, e, float(scores[idx]), separator_bearing)
+
+        elif prefix == "B":
+            _flush()
+            current_type = etype
+            current_tokens = [idx]
+
+        elif prefix in ("I", "E"):
+            if current_type == etype:
+                current_tokens.append(idx)
+                if prefix == "E":
+                    _flush()
+            else:
+                _flush()
+                current_type = etype
+                current_tokens = [idx]
+
+        else:
+            _flush()
+
+    _flush()
+    return spans
+
+
+def download_onnx_model(
+    repo_id: str = "openai/privacy-filter",
+    variant: str | None = None,
+    cache_dir: str | None = None,
+    revision: str | None = None,
+) -> Path:
+    from huggingface_hub import _CACHED_NO_EXIST, hf_hub_download, try_to_load_from_cache
+
+    # No default of its own: a caller that omits the variant (the Docker image
+    # prefetch) must fetch the file the detector will load at startup.
+    if variant is None:
+        variant = OnnxDetectorConfig().onnx_variant
+
+    # EntryNotFoundError moved to the top-level .errors module in hub 0.25; older
+    # versions (pyproject floors at 0.23) expose it only under .utils. Import
+    # defensively so a floor install does not crash the default onnx detector.
+    try:
+        from huggingface_hub.errors import EntryNotFoundError
+    except ImportError:  # pragma: no cover - only on hub < 0.25
+        from huggingface_hub.utils import EntryNotFoundError
+
+    def cached(filename: str) -> Any:
+        """What the local cache knows about a file of a pinned revision.
+
+        hf_hub_download asks the Hub about a file it has not seen at this
+        revision, and for a file that does not exist (the side file of a
+        single-file variant) it asks again on every start. A pinned commit
+        never changes, so what the cache knows about it is final. A moving
+        revision (a branch name) is always resolved by the Hub.
+        """
+        if not revision or not _COMMIT_HASH.fullmatch(revision):
+            return None
+        return try_to_load_from_cache(repo_id, filename, cache_dir=cache_dir, revision=revision)
+
+    def download(filename: str) -> Path:
+        return Path(
+            hf_hub_download(
+                repo_id=repo_id, filename=filename, cache_dir=cache_dir, revision=revision
+            )
+        )
+
+    model_file = f"onnx/model_{variant}.onnx"
+    known = cached(model_file)
+    local_path = Path(known) if isinstance(known, str) else download(model_file)
+
+    # Only variants with externalized weights ship this side file; a variant
+    # packed into a single .onnx must not fail here.
+    data_path: Path | None = None
+    known = cached(f"{model_file}_data")
+    if isinstance(known, str):
+        data_path = Path(known)
+    elif known is not _CACHED_NO_EXIST:
+        try:
+            data_path = download(f"{model_file}_data")
+        except EntryNotFoundError:
+            pass
+    if data_path is None:
+        logger.info("Variant %s has no .onnx_data side file (single-file model)", variant)
+
+    model_path = colocate_external_data(local_path, data_path)
+    logger.info("ONNX model ready at %s", model_path)
+    return model_path
+
+
+# Folder, inside the model repo's cache folder, where the model and its external
+# weights are placed side by side when the cache keeps them apart.
+_COLOCATED_DIR = "privaite-onnx"
+
+
+def colocate_external_data(model_path: Path, data_path: Path | None) -> Path:
+    """Return a path to the model that onnxruntime will load with its weights.
+
+    onnxruntime refuses an external data file that resolves outside the model
+    file's real folder. The hub cache hands out symlinks, and since
+    huggingface_hub 1.33 their targets sit in different shard folders of a
+    cache-wide blob store (hub/blobs/60/..., hub/blobs/88/...): the default
+    model no longer loaded from a fresh cache. When the two real files do not
+    share a folder, they are placed side by side in a folder of our own, as
+    hard links (no copy and no download, so a pre-seeded offline cache keeps
+    working), or as a copy when the filesystem refuses a link.
+    """
+    if data_path is None:
+        return model_path
+    real_model, real_data = model_path.resolve(), data_path.resolve()
+    if real_model.parent == real_data.parent:
+        return model_path
+    # Inside the repo's cache folder, so deleting the repo from the cache
+    # deletes this too. Named after both blobs: a folder that exists always
+    # holds the right pair, and a new revision gets its own.
+    repo_dir = next(
+        (parent.parent for parent in model_path.parents if parent.name == "snapshots"),
+        model_path.parent,
+    )
+    target = repo_dir / _COLOCATED_DIR / f"{real_model.name[:16]}-{real_data.name[:16]}"
+    placed: list[str] = []
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        for source, name in ((real_model, model_path.name), (real_data, data_path.name)):
+            dest = target / name
+            if dest.exists():
+                continue
+            # Written under a private name, then renamed: a concurrent start
+            # never sees a half-copied file.
+            partial = target / f".{name}.{os.getpid()}.partial"
+            partial.unlink(missing_ok=True)
+            try:
+                os.link(source, partial)
+            except OSError:
+                shutil.copyfile(source, partial)
+            os.replace(partial, dest)
+            placed.append(name)
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot place the ONNX model and its external weights side by side in "
+            f"{target} ({exc.strerror or type(exc).__name__}): make the Hugging Face "
+            "cache writable, or download the model again with HF_HUB_DISABLE_SHARED_BLOBS=1"
+        ) from exc
+    if placed:
+        logger.info("Placed %s side by side in %s", ", ".join(placed), target)
+    return target / model_path.name
+
+
+class OnnxPrivacyFilterDetector(PIIDetector):
+    def __init__(self, config: OnnxDetectorConfig) -> None:
+        self.config = config
+        self._session: Any = None
+        self._tokenizer: Any = None
+
+    @property
+    def name(self) -> str:
+        return "onnx"
+
+    async def initialize(self) -> None:
+        def _load() -> None:
+            import onnxruntime as ort
+            from transformers import AutoTokenizer
+
+            # A host that initialised ONNX Runtime before importing privaite
+            # (Open WebUI does) no longer reads ORT_DISABLE_TELEMETRY.
+            telemetry_off = getattr(ort, "disable_telemetry_events", None)
+            if telemetry_off is not None:
+                telemetry_off()
+
+            tokenizer = self._load_tokenizer(AutoTokenizer)
+            # Manual windows support tokenizers with no special tokens only.
+            # Reject others at startup rather than omit their required framing.
+            if tokenizer.num_special_tokens_to_add() != 0:
+                raise ValueError(
+                    "ONNX windowing does not support tokenizers that add special tokens"
+                )
+            self._tokenizer = tokenizer
+
+            model_path = download_onnx_model(
+                repo_id=self.config.model_name,
+                variant=self.config.onnx_variant,
+                cache_dir=self.config.cache_dir,
+                revision=self.config.revision,
+            )
+
+            requested = self._get_providers()
+            logger.info(
+                "Creating ONNX session (variant=%s, requested_providers=%s)",
+                self.config.onnx_variant,
+                requested,
+            )
+
+            sess_opts = ort.SessionOptions()
+            sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            self._session = ort.InferenceSession(
+                str(model_path),
+                sess_options=sess_opts,
+                providers=requested,
+            )
+            self._log_session_providers(requested)
+
+        logger.info("Loading ONNX privacy-filter model (%s)...", self.config.model_name)
+        await asyncio.to_thread(_load)
+        logger.info("ONNX model loaded successfully")
+
+    def _load_tokenizer(self, auto_tokenizer: Any) -> Any:
+        """The tokenizer, from the local cache when the revision is pinned.
+
+        from_pretrained checks the Hub for each file even when all of them are
+        cached. A pinned commit never changes, so the cache is tried first and
+        the Hub only asked when something is missing.
+        """
+        kwargs = {
+            "revision": self.config.revision,
+            "trust_remote_code": self.config.trust_remote_code,
+        }
+        if self.config.revision and _COMMIT_HASH.fullmatch(self.config.revision):
+            try:
+                return auto_tokenizer.from_pretrained(
+                    self.config.model_name, local_files_only=True, **kwargs
+                )
+            except OSError:
+                pass
+        return auto_tokenizer.from_pretrained(self.config.model_name, **kwargs)
+
+    def _log_session_providers(self, requested: list[str]) -> None:
+        """Report the execution providers the session ACTUALLY runs on.
+
+        onnxruntime does not fail when a requested provider is absent from the
+        build: it emits a Python UserWarning and builds a CPU session. Logging
+        the requested list alone printed "CUDAExecutionProvider" on a CPU-only
+        machine, so an operator could not tell a working accelerator from a
+        silent fallback."""
+        active = list(self._session.get_providers())
+        missing = [provider for provider in requested if provider not in active]
+        if missing:
+            logger.warning(
+                "Requested ONNX execution provider(s) %s not available in this "
+                "onnxruntime build; the session runs on %s",
+                missing,
+                active,
+            )
+        logger.info("ONNX session providers: %s", active)
+
+    def _get_providers(self) -> list[str]:
+        device = self.config.device
+        if device == "auto":
+            import onnxruntime as ort
+
+            available = ort.get_available_providers()
+            # "auto" deliberately never selects CoreML. Measured on this model
+            # (M1 Pro, onnxruntime 1.27): CoreML covers only 28 of 365 graph
+            # nodes in 25 partitions, is slower than CPU at every input size
+            # (0.88s vs 0.47s at 511 tokens, 8.55s vs 1.50s at 2046), and each
+            # new input shape accumulates compiled-model memory until the
+            # kernel kills the process. There is no size at which it wins, so
+            # do not "restore" it here; device: "coreml" stays as an explicit
+            # opt-in below.
+            if "CUDAExecutionProvider" in available:
+                return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            return ["CPUExecutionProvider"]
+        if device == "cuda":
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        if device in ("coreml", "mps"):
+            return ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+        # Only "cpu" reaches here: the config schema refuses every other value at
+        # boot, so this is no longer a silent catch-all for typos.
+        return ["CPUExecutionProvider"]
+
+    @inference_request
+    async def detect(self, text: str, language: str = "en") -> list[PIIEntity]:
+        if self._session is None or self._tokenizer is None:
+            raise RuntimeError("OnnxPrivacyFilterDetector not initialized")
+
+        results = await asyncio.to_thread(self._run_inference, text)
+
+        pii_entities: list[PIIEntity] = []
+        for span in results:
+            if span["score"] < self.config.score_threshold:
+                continue
+
+            mapped_type = self.config.label_mapping.get(span["entity_type"])
+            if not mapped_type:
+                continue
+
+            pii_entities.append(
+                PIIEntity(
+                    entity_type=mapped_type,
+                    text=span["text"],
+                    start=span["start"],
+                    end=span["end"],
+                    score=span["score"],
+                    source="onnx",
+                )
+            )
+
+        return [piece for entity in pii_entities for piece in refine_spans(text, entity)]
+
+    def _window_geometry(self) -> tuple[int, int]:
+        """Effective (window, overlap) in tokens. ``max_length`` used to be a
+        truncation cap whose overflow was forwarded unscanned; it now bounds the
+        per-window sequence length instead (capped at _WINDOW_TOKENS), and the
+        text is always covered whole."""
+        window = min(self.config.max_length, _WINDOW_TOKENS)
+        return window, min(_WINDOW_OVERLAP, max(window // 8, 1))
+
+    def _run_inference(self, text: str) -> list[dict]:
+        window, overlap = self._window_geometry()
+        # Tokenizer overflow can silently drop rows, so slice the full encoding
+        # ourselves and verify coverage of both source tokens and original text.
+        encoding = self._tokenizer(
+            text,
+            add_special_tokens=False,
+            truncation=False,
+            return_offsets_mapping=True,
+        )
+        token_count = len(encoding["input_ids"])
+        ranges = _window_ranges(token_count, window, overlap)
+        _check_window_coverage(ranges, token_count)
+        windows = {}
+        for key in ("input_ids", "attention_mask", "token_type_ids", "offset_mapping"):
+            if key in encoding:
+                if len(encoding[key]) != token_count:
+                    raise RuntimeError("Inconsistent ONNX token encoding lengths")
+                windows[key] = [encoding[key][start:end] for start, end in ranges]
+        _check_text_coverage(encoding["offset_mapping"], text)
+        input_names = {inp.name for inp in self._session.get_inputs()}
+        rows = [self._run_window(windows, row, input_names) for row in range(len(ranges))]
+        labels, scores, offsets = _stitch_windows(rows, overlap)
+        return decode_bioes_spans(labels, scores, offsets, text)
+
+    def _run_window(self, encoding: Any, row: int, input_names: set[str]) -> _WindowTokens:
+        """Run one window through the session and return its filtered per-token
+        predictions with offsets absolute into the original text."""
+        feed = {}
+        for key in ("input_ids", "attention_mask", "token_type_ids"):
+            if key in input_names and key in encoding:
+                feed[key] = np.asarray([encoding[key][row]], dtype=np.int64)
+
+        cache = current_window_cache() if self.config.deduplicate_windows else None
+        cache_key = None
+        if cache is not None:
+            cache_key = cache.key(
+                self._session,
+                [(name, value.shape, value.tobytes()) for name, value in sorted(feed.items())],
+            )
+        predictions = cache.get(cache_key) if cache is not None and cache_key is not None else None
+        if predictions is None:
+            logits = self._session.run(None, feed)[0][0]
+            exp = np.exp(logits - logits.max(axis=-1, keepdims=True))
+            probs = exp / exp.sum(axis=-1, keepdims=True)
+            predictions = (
+                tuple(int(label) for label in probs.argmax(axis=-1)),
+                tuple(float(score) for score in probs.max(axis=-1)),
+            )
+            if cache is not None and cache_key is not None:
+                cache.put(cache_key, predictions)
+        pred_ids, pred_scores = predictions
+
+        labels: list[str] = []
+        scores: list[float] = []
+        offsets: list[tuple[int, int]] = []
+        for i, (start, end) in enumerate(encoding["offset_mapping"][row]):
+            if start == end:
+                # Special or padding token: it maps to no source characters.
+                continue
+            labels.append(ID2LABEL.get(int(pred_ids[i]), "O"))
+            scores.append(float(pred_scores[i]))
+            offsets.append((int(start), int(end)))
+        return labels, scores, offsets
+
+    async def shutdown(self) -> None:
+        self._session = None
+        self._tokenizer = None

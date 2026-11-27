@@ -1,0 +1,58 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Download spaCy models
+        run: |
+          python -m spacy download en_core_web_lg
+          python -m spacy download fr_core_news_md
+
+      - name: Download Privacy Filter tokenizer
+        run: |
+          python - <<'PY'
+          from transformers import AutoTokenizer
+          from privaite.config.schema import OnnxDetectorConfig
+          config = OnnxDetectorConfig()
+          AutoTokenizer.from_pretrained(config.model_name, revision=config.revision, trust_remote_code=False)
+          PY
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Format
+        run: ruff format --check .
+
+      - name: Type check
+        run: mypy privaite/ integrations/openwebui/privaite_filter.py integrations/litellm/privaite_guardrail.py
+
+      - name: Test
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: python -m pytest tests/ -q
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

@@ -1,0 +1,67 @@
+# Digest-pinned base image, refreshed by hand at every release (Debian security
+# fixes): docker buildx imagetools inspect python:3.13-slim, then move the date.
+# Base image checked on 2026-11-22
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Dependencies that contact a third party on their own (ONNX Runtime telemetry,
+# Hugging Face Hub pings, LiteLLM's price table): off for every Python process
+# in the image, the build-time model prefetch included. privaite sets the same
+# defaults at import.
+ENV ORT_DISABLE_TELEMETRY=1 \
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    LITELLM_LOCAL_MODEL_COST_MAP=True
+
+COPY pyproject.toml .
+COPY privaite/ privaite/
+RUN pip install --no-cache-dir .
+
+RUN python -m spacy download en_core_web_lg && \
+    python -m spacy download fr_core_news_md
+
+# Run as a non-root user. Created BEFORE the model prefetch below so the Hugging
+# Face cache is written into a directory that user owns; otherwise the container
+# would re-download the model on every start.
+RUN useradd --create-home --uid 10001 privaite
+ENV HF_HOME=/home/privaite/.cache/huggingface
+USER privaite
+
+# Pre-download the default ONNX Privacy Filter model and tokenizer so the
+# container starts fast and works offline from the first request.
+# --build-arg ONNX_VARIANT=q4f16 bakes the other variant instead; the mounted
+# config then needs the same pii.detectors.onnx.onnx_variant, or the first
+# start downloads the default one.
+ARG ONNX_VARIANT=""
+RUN python -c "import os; from privaite.config.schema import OnnxDetectorConfig; from privaite.pii.detector_onnx import download_onnx_model; config = OnnxDetectorConfig(); download_onnx_model(repo_id=config.model_name, variant=os.environ.get('ONNX_VARIANT') or config.onnx_variant, revision=config.revision)" && \
+    python -c "from privaite.config.schema import OnnxDetectorConfig; from transformers import AutoTokenizer; config = OnnxDetectorConfig(); AutoTokenizer.from_pretrained(config.model_name, revision=config.revision, trust_remote_code=config.trust_remote_code)"
+
+# --build-arg MINILM=onnx (or onnx_int8) also bakes PrivAiTe's MiniLM model for
+# preset: minilm, so that preset starts offline too. Off by default: the
+# default preset does not use it, and it adds about 490 MB (120 MB for
+# onnx_int8). The mounted config then needs the same pii.detectors.minilm.backend.
+ARG MINILM=""
+RUN if [ -n "$MINILM" ]; then \
+      python -c "import os; from privaite.config.schema import MiniLMDetectorConfig; from privaite.pii.detector_minilm import BACKEND_FILES, download_minilm_files; config = MiniLMDetectorConfig(); download_minilm_files(config.model_name, ('config.json',) + BACKEND_FILES[os.environ['MINILM']], revision=config.revision)" && \
+      python -c "from privaite.config.schema import MiniLMDetectorConfig; from transformers import AutoTokenizer; config = MiniLMDetectorConfig(); AutoTokenizer.from_pretrained(config.model_name, revision=config.revision)"; \
+    fi
+
+COPY config/ config/
+
+EXPOSE 8400
+
+# /ready, not /health: /health is a static dict that answers ok even when the
+# PII engine is missing and every request 502s. /ready returns 503 until the
+# engine is up. The start period covers the first-run model load.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
+    CMD curl -f http://localhost:8400/ready || exit 1
+
+# Config selection, in order: a mounted config/privaite.yaml wins; otherwise, if
+# OPENAI_API_KEY is set, the drop-in OpenAI config is used (docker run -e
+# OPENAI_API_KEY=... just works); otherwise the local Ollama example config, so
+# the image still boots out of the box.
+CMD ["sh", "-c", "if [ -f /app/config/privaite.yaml ]; then CFG=/app/config/privaite.yaml; elif [ -n \"$OPENAI_API_KEY\" ]; then CFG=/app/config/privaite.openai.yaml; else CFG=/app/config/privaite.example.yaml; fi; exec python -m privaite --config \"$CFG\""]

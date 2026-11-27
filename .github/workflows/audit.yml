@@ -1,0 +1,72 @@
+# Weekly dependency audit: install the package (all extras) at the newest
+# versions the pyproject floors allow, then check that resolution against the
+# OSV/PyPI advisory databases with pip-audit. A red run means a floor lets pip
+# resolve a version with a known CVE: raise the floor past the fixed release
+# (see pyproject.toml comments for the ones already raised). This is the
+# deliberate counterpart to Dependabot: it signals, a human bumps.
+# Advisories whose fix no floor of ours can reach get a commented
+# --ignore-vuln entry on the audit step instead of a permanently red run.
+name: Dependency audit
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install package with all extras (freshest allowed resolution)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[ml,gliner,dev]"
+
+      - name: Audit resolved environment
+        # Ignored advisories (keep minimal, one justification per entry).
+        # The GHSA-537c-gmf6-5ccf entry is gone: it existed only while
+        # presidio-anonymizer capped cryptography<47, and 2.2.364 requires
+        # cryptography>=48.0.1, so the freshest resolution our floors allow now
+        # reaches the fixed release on its own.
+        # PYSEC-2026-3552, PYSEC-2026-3553 and PYSEC-2026-3554 are cryptography
+        # advisories fixed in 49.0.0 and 50.0.0. presidio-anonymizer 2.2.364
+        # requires cryptography<49.0.0, so no floor of ours can reach a fixed
+        # release: ignoring them keeps the run meaningful instead of permanently
+        # red. Drop these three the moment presidio-anonymizer allows >=49.
+        # CVE-2026-112907, CVE-2026-112908, CVE-2026-112909, CVE-2026-112910,
+        # CVE-2026-112911, CVE-2026-112912, CVE-2026-112913, CVE-2026-112915,
+        # CVE-2026-112935, CVE-2026-112936, CVE-2026-112938, CVE-2026-112939 and
+        # CVE-2026-112940 are filelock advisories fixed in 4.2.1 (lock files
+        # tampered with by another local user on the same machine). litellm
+        # 1.108.1 requires filelock<4.0, so no floor of ours can reach 4.2.1;
+        # litellm main already allows <5 (1.109.0rc1). Drop these thirteen the
+        # moment litellm 1.109.0 is on PyPI.
+        run: |
+          pip install pip-audit
+          pip-audit --skip-editable \
+            --ignore-vuln PYSEC-2026-3552 \
+            --ignore-vuln PYSEC-2026-3553 \
+            --ignore-vuln PYSEC-2026-3554 \
+            --ignore-vuln CVE-2026-112907 \
+            --ignore-vuln CVE-2026-112908 \
+            --ignore-vuln CVE-2026-112909 \
+            --ignore-vuln CVE-2026-112910 \
+            --ignore-vuln CVE-2026-112911 \
+            --ignore-vuln CVE-2026-112912 \
+            --ignore-vuln CVE-2026-112913 \
+            --ignore-vuln CVE-2026-112915 \
+            --ignore-vuln CVE-2026-112935 \
+            --ignore-vuln CVE-2026-112936 \
+            --ignore-vuln CVE-2026-112938 \
+            --ignore-vuln CVE-2026-112939 \
+            --ignore-vuln CVE-2026-112940

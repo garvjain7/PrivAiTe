@@ -1,0 +1,875 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import logging
+from typing import Any, NamedTuple
+
+from privaite.config.schema import PIIConfig
+from privaite.pii.allow_list import ALWAYS_PROTECTED, apply_allow_list, compile_rules
+from privaite.pii.anonymizer import Anonymizer
+from privaite.pii.cache import DetectionCache, entities_from_spans, spans_from_entities
+from privaite.pii.deanonymizer import DeAnonymizer
+from privaite.pii.detector_base import PIIDetector
+from privaite.pii.entity import PIIEntity, merge_entities
+from privaite.pii.mapping import PIIMapping
+from privaite.pii.window_cache import inference_request
+
+logger = logging.getLogger("privaite.pii.engine")
+
+# A credential the structured rules identified is a credential wherever the
+# request repeats it afterwards. An agent given a restored password repeats it
+# bare, in its reasoning or in the next command, where no detector has any
+# context to recognise it. The rules are the gate on purpose: a model labels
+# identifiers as secrets often enough that spreading its guesses rewrites the
+# text the agent works on (24 copies of a plugin name in one Codex session).
+# Shorter values, plain words and bare numbers stay out for the same reason:
+# after a credential field they are as often code (api_key=api_key) as a value.
+_PROPAGATED_MIN_LENGTH = 8
+
+
+def _token_shaped(value: str) -> bool:
+    return (
+        len(value) >= _PROPAGATED_MIN_LENGTH
+        and any(c.isdigit() for c in value)
+        and not value.isdigit()
+    )
+
+
+def _stands_alone(text: str, start: int, end: int) -> bool:
+    """False when the match is the middle of a longer identifier: a different string."""
+    before = text[start - 1] if start else ""
+    after = text[end] if end < len(text) else ""
+    return not (text[start].isalnum() and before.isalnum()) and not (
+        text[end - 1].isalnum() and after.isalnum()
+    )
+
+
+_KNOWN_MEDIA_PART_TYPES = frozenset(
+    {"image_url", "image", "input_audio", "audio", "video", "file", "document", "refusal"}
+)
+
+
+class UnsupportedContentError(Exception):
+    """Raised in strict mode when a payload shape cannot be inspected for PII."""
+
+
+class PIIProcessingError(RuntimeError):
+    """A safe error for an unexpected PII-processing failure.
+
+    Detector and anonymizer exceptions can include the text they were given. Do
+    not let those exceptions cross a request boundary: integration hosts commonly
+    log unhandled exceptions, which would turn a fail-closed request into a PII
+    log leak.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("PII processing failed")
+
+
+class PIIBlockedError(Exception):
+    """Raised when a request contains a PII type configured to be blocked outright
+    (pii.block_entities). Carries the entity TYPES that triggered the block, never
+    the underlying PII values."""
+
+    def __init__(self, entity_types: set[str]) -> None:
+        self.entity_types = sorted(entity_types)
+        super().__init__(
+            "request blocked: contains disallowed PII type(s): " + ", ".join(self.entity_types)
+        )
+
+
+class DetectionReport(NamedTuple):
+    """One text's merged detections (what gets replaced), plus what
+    pii.allow_list let through and the detections that kept a listed value
+    redacted. The last two are empty without the list."""
+
+    entities: list[PIIEntity]
+    allowed: list[PIIEntity]
+    not_allowed: list[PIIEntity]
+
+
+class PIIEngine:
+    def __init__(self, config: PIIConfig) -> None:
+        self.config = config
+        self.detectors: list[PIIDetector] = []
+        self.anonymizer = Anonymizer(config.anonymization)
+        self.deanonymizer = DeAnonymizer(config.deanonymization)
+        # Types that cause a hard reject (empty = default: mask everything).
+        self._blocked: set[str] = set(config.block_entities or [])
+        # Operator exemptions (pii.allow_list): compiled once, applied in
+        # _detect_all. Entries without entity_types never touch a credential or
+        # a blocked type.
+        self._allow_rules = compile_rules(config.allow_list)
+        self._allow_protected = ALWAYS_PROTECTED | frozenset(self._blocked)
+        # pii.max_concurrent_detections: how many texts run through the
+        # detectors at once; None leaves them unbounded, as before.
+        self._detections: asyncio.Semaphore | None = (
+            asyncio.Semaphore(config.max_concurrent_detections)
+            if config.max_concurrent_detections
+            else None
+        )
+        # Opt-in detection cache (spans only, never values); None when disabled
+        # so the disabled path is byte-for-byte the pre-cache code path.
+        self._cache: DetectionCache | None = (
+            DetectionCache(
+                config.detection_cache.max_entries,
+                config.detection_cache.ttl_seconds,
+            )
+            if config.detection_cache.enabled
+            else None
+        )
+        # The rules that qualify a value for propagation (_with_known_values).
+        # They follow the Presidio detector: switched off with it, or by name.
+        self._secret_rules: Any = None
+        presidio = config.detectors.presidio
+        if presidio.enabled and "StructuredSecretRecognizer" not in presidio.disabled_recognizers:
+            from privaite.pii.recognizer_secret import StructuredSecretRecognizer
+
+            self._secret_rules = StructuredSecretRecognizer()
+        self._ready = False
+
+    @property
+    def is_ready(self) -> bool:
+        return self._ready
+
+    def _producible_entity_types(self) -> set[str] | None:
+        """The union of entity types the ENABLED detectors can emit, from config
+        alone. None means "cannot be determined precisely" (Presidio without an
+        entity allowlist, an ML detector with an empty label_mapping, or no
+        detector enabled at all): callers must then skip validation rather than
+        risk rejecting a working config."""
+        detectors = self.config.detectors
+        enabled_ml = [
+            cfg
+            for cfg in (
+                detectors.bert_ner,
+                detectors.mlmodel,
+                detectors.onnx,
+                detectors.minilm,
+                detectors.gliner,
+            )
+            if cfg.enabled
+        ]
+        if not detectors.presidio.enabled and not enabled_ml:
+            return None  # the dedicated zero-detector startup check reports it
+        producible: set[str] = set()
+        if detectors.presidio.enabled:
+            if not detectors.presidio.entities:
+                return None  # full Presidio registry: could emit nearly any type
+            from privaite.pii.detector_presidio import builtin_recognizer_entity_types
+
+            producible |= set(detectors.presidio.entities)
+            # Custom patterns and the recognizers PrivAiTe registers itself run
+            # inside the Presidio detector and are exempt from its entity
+            # allowlist, so they widen what it can emit.
+            producible |= {p.entity_type for p in self.config.custom_patterns}
+            producible |= builtin_recognizer_entity_types(detectors.presidio.disabled_recognizers)
+        for cfg in enabled_ml:
+            if not cfg.label_mapping:
+                return None  # unknown label set: treat as able to emit anything
+            producible |= set(cfg.label_mapping.values())
+        return producible
+
+    def _validate_block_entities(self) -> None:
+        """Refuse to start when block_entities lists a type that no enabled
+        detector can emit: the gate would silently never fire, which is
+        fail-open by configuration. Deliberately conservative: skipped whenever
+        the producible set is unknown (better to under-warn than to break a
+        legitimate startup)."""
+        if not self._blocked:
+            return
+        producible = self._producible_entity_types()
+        if producible is None:
+            return
+        unenforceable = sorted(self._blocked - producible)
+        if unenforceable:
+            raise ValueError(
+                "block_entities lists type(s) that no enabled detector can "
+                "emit, so they would never block anything: "
+                + ", ".join(unenforceable)
+                + ". Remove them from block_entities or enable a detector that "
+                "produces them (presidio entities, a label_mapping, or a "
+                "custom_patterns entity_type)."
+            )
+
+    def _warn_allow_list_on_blocked_types(self) -> None:
+        """An entry that names a blocked type is a deliberate hole in the hard
+        policy gate: a value it matches is forwarded instead of rejected. Say so
+        at startup, naming the types, never a value."""
+        named = sorted(
+            {
+                entity_type
+                for entry in self.config.allow_list
+                for entity_type in entry.entity_types or ()
+                if entity_type in self._blocked
+            }
+        )
+        if named:
+            logger.warning(
+                "allow_list entries name blocked type(s) %s: a value they match is "
+                "forwarded instead of rejected",
+                ", ".join(named),
+            )
+
+    async def initialize(self) -> None:
+        # Config-only validation first: it must fail before any model download
+        # or load is paid for.
+        self._validate_block_entities()
+        self._warn_allow_list_on_blocked_types()
+
+        if self.config.detectors.presidio.enabled:
+            from privaite.pii.detector_presidio import PresidioDetector
+
+            detector: PIIDetector = PresidioDetector(
+                self.config.detectors.presidio,
+                custom_patterns=self.config.custom_patterns,
+            )
+            await detector.initialize()
+            self.detectors.append(detector)
+            logger.info("Presidio detector initialized")
+
+        if self.config.detectors.bert_ner.enabled:
+            from privaite.pii.detector_bert_ner import BertNERDetector
+
+            detector = BertNERDetector(self.config.detectors.bert_ner)
+            await detector.initialize()
+            self.detectors.append(detector)
+            logger.info("BERT NER detector initialized")
+
+        if self.config.detectors.mlmodel.enabled:
+            from privaite.pii.detector_mlmodel import MLModelDetector
+
+            detector = MLModelDetector(self.config.detectors.mlmodel)
+            await detector.initialize()
+            self.detectors.append(detector)
+            logger.info("ML model detector initialized")
+
+        if self.config.detectors.onnx.enabled:
+            from privaite.pii.detector_onnx import OnnxPrivacyFilterDetector
+
+            detector = OnnxPrivacyFilterDetector(self.config.detectors.onnx)
+            await detector.initialize()
+            self.detectors.append(detector)
+            logger.info("ONNX privacy-filter detector initialized")
+
+        if self.config.detectors.minilm.enabled:
+            from privaite.pii.detector_minilm import MiniLMDetector
+
+            detector = MiniLMDetector(self.config.detectors.minilm)
+            await detector.initialize()
+            self.detectors.append(detector)
+            logger.info("PrivAiTe MiniLM detector initialized")
+
+        if self.config.detectors.gliner.enabled:
+            from privaite.pii.detector_gliner import GlinerDetector
+
+            detector = GlinerDetector(self.config.detectors.gliner)
+            await detector.initialize()
+            self.detectors.append(detector)
+            logger.info("GLiNER detector initialized")
+
+        if self.config.enabled and not self.detectors:
+            # pii.enabled=true with every detector switched off would serve every
+            # request with detection silently doing nothing. Refuse to start; an
+            # operator who wants passthrough must set pii.enabled=false explicitly.
+            raise ValueError(
+                "pii.enabled is true but no detector is enabled: detection would "
+                "be silently off. Enable a detector or set pii.enabled: false"
+            )
+
+        if self.config.merge_strategy == "intersection" and len(self.detectors) < 2:
+            # Intersection keeps only spans confirmed by >=2 detectors. With fewer
+            # detectors NOTHING can ever be confirmed, so every request would be
+            # forwarded with all its PII raw. Refuse to start instead.
+            raise ValueError(
+                "merge_strategy 'intersection' requires at least 2 enabled "
+                f"detectors, got {len(self.detectors)}: it would silently disable "
+                "all PII detection"
+            )
+
+        self._ready = True
+        logger.info("PII engine ready with %d detector(s)", len(self.detectors))
+
+    async def warmup(self) -> None:
+        """Exercise the detectors once so the first real request does not pay
+        cold-start cost (onnxruntime graph warm, spaCy first-parse JIT). Models
+        are already loaded by initialize(); this just runs one throwaway pass."""
+        if not self.detectors:
+            return
+        try:
+            await self.process_request([{"role": "user", "content": "warm up jean@example.com"}])
+        except Exception:  # pragma: no cover - warmup is best-effort, never fatal
+            # Never include an exception or traceback here: a detector may have
+            # copied its input into the exception message.
+            logger.warning("PII engine warmup pass failed (non-fatal)")
+
+    async def shutdown(self) -> None:
+        # Drop the cached detection metadata FIRST: even if a detector refuses
+        # to shut down cleanly, nothing PII-derived may outlive the engine.
+        if self._cache is not None:
+            self._cache.clear()
+        for detector in self.detectors:
+            await detector.shutdown()
+        self._ready = False
+
+    @inference_request
+    async def process_request(
+        self, messages: list[dict[str, Any]], other_fields: Any = None
+    ) -> tuple[list[dict[str, Any]], PIIMapping]:
+        """Anonymize a request, exposing only safe failures to callers.
+
+        Both in-process integrations let this exception propagate to their host,
+        which may log it. Keep expected policy errors intact, but deliberately
+        discard all other exception details because they may contain raw input.
+
+        ``other_fields`` is the rest of the request body (tools, prediction...).
+        It is only read, for the placeholder-shaped strings it already holds: no
+        placeholder issued for this request may equal one of them.
+        """
+        try:
+            return await self._process_request(messages, other_fields)
+        except (PIIBlockedError, UnsupportedContentError, PIIProcessingError):
+            raise
+        except Exception:
+            logger.error("PII request processing failed; request will be blocked")
+            raise PIIProcessingError() from None
+
+    async def _process_request(
+        self, messages: list[dict[str, Any]], other_fields: Any = None
+    ) -> tuple[list[dict[str, Any]], PIIMapping]:
+        mapping = PIIMapping()
+        # Before any placeholder is issued: a literal "<PERSON_1>" in a later
+        # message, a passthrough system message or a tool definition must keep
+        # that number to itself (see Anonymizer._shield_literals).
+        mapping.reserve(messages)
+        mapping.reserve(other_fields)
+        language = self._language()
+        anonymized_messages = []
+
+        for message in messages:
+            role = message.get("role", "")
+
+            if self.config.passthrough.system_messages and role == "system":
+                anonymized_messages.append(dict(message))
+                continue
+
+            new_msg = dict(message)
+
+            if "content" in message:
+                new_msg["content"] = await self._anonymize_content(
+                    message["content"], mapping, language
+                )
+
+            # These plaintext response fields are restored for the client and
+            # can return in assistant history on the next request.
+            for field in ("reasoning_content", "reasoning", "refusal"):
+                value = message.get(field)
+                if isinstance(value, str):
+                    new_msg[field] = await self._anonymize_text(value, mapping, language)
+            audio = message.get("audio")
+            if isinstance(audio, dict) and isinstance(audio.get("transcript"), str):
+                new_audio = dict(audio)
+                new_audio["transcript"] = await self._anonymize_text(
+                    audio["transcript"], mapping, language
+                )
+                new_msg["audio"] = new_audio
+
+            if not self.config.passthrough.tool_calls and message.get("tool_calls"):
+                new_msg["tool_calls"] = await self._anonymize_tool_calls(
+                    message["tool_calls"], mapping, language
+                )
+
+            # Legacy (pre-tool_calls) OpenAI function calling.
+            if not self.config.passthrough.tool_calls and message.get("function_call"):
+                new_msg["function_call"] = await self._anonymize_function_call(
+                    message["function_call"], mapping, language
+                )
+
+            anonymized_messages.append(new_msg)
+
+        return anonymized_messages, mapping
+
+    def _language(self) -> str:
+        langs = self.config.detectors.presidio.languages
+        return langs[0] if langs else "en"
+
+    @inference_request
+    async def process_request_value(self, value: Any, mapping: PIIMapping) -> Any:
+        """Anonymize one auxiliary request-side value (a string, or a JSON-like
+        dict/list structure whose string and long-numeric leaves are scrubbed)
+        into an existing per-request mapping.
+
+        Used for text-bearing request fields outside ``messages`` that would
+        otherwise be forwarded verbatim by the kwargs passthrough: chat
+        ``prediction.content`` (predicted outputs carry the client's current
+        document), ``web_search_options.user_location``, and the completions
+        ``suffix``. These are request inputs, so they only need scrubbing, never
+        a dedicated restore path. Same single choke point (``_anonymize_text``,
+        so the block gate applies) and same safe-error policy as
+        ``process_request``.
+        """
+        try:
+            return await self._walk_anonymize(value, mapping, self._language())
+        except (PIIBlockedError, UnsupportedContentError, PIIProcessingError):
+            raise
+        except Exception:
+            logger.error("PII request processing failed; request will be blocked")
+            raise PIIProcessingError() from None
+
+    async def _anonymize_text(self, text: Any, mapping: PIIMapping, language: str) -> Any:
+        if not text or not isinstance(text, str):
+            return text
+        try:
+            entities = await self._detect_all(text, language)
+            entities = self._with_known_values(text, entities, mapping)
+            # Hard policy gate: if any detected type is blocked, reject the whole
+            # request before anonymizing (nothing is forwarded). This single choke
+            # point covers message content, multimodal text, and tool-call arguments.
+            if self._blocked:
+                hit = {e.entity_type for e in entities if e.entity_type in self._blocked}
+                if hit:
+                    raise PIIBlockedError(hit)
+            return self.anonymizer.anonymize(text, entities, mapping)
+        except (PIIBlockedError, PIIProcessingError):
+            raise
+        except Exception:
+            # The anonymizer receives raw text too, so it must not expose an
+            # implementation error (or its traceback) to a host logger.
+            logger.error("PII anonymization failed; request will be blocked")
+            raise PIIProcessingError() from None
+
+    def _type_priorities(self, entities: list[PIIEntity]) -> dict[str, int]:
+        return {
+            entity.entity_type: (
+                2
+                if entity.entity_type in self._blocked
+                else int(self.anonymizer.is_irreversible(entity.entity_type))
+            )
+            for entity in entities
+        }
+
+    def _with_known_values(
+        self, text: str, entities: list[PIIEntity], mapping: PIIMapping
+    ) -> list[PIIEntity]:
+        """Add the copies of already identified credentials that no detector reported.
+
+        A value qualifies when a structured secret rule matches it and a detection
+        covers that match, in this text or in one scrubbed earlier in the request.
+        A copy enters the usual overlap resolution: the span is the union of every
+        detection it touches, so no part of the value is left out, and the
+        configured policy still decides the type (a blocked type keeps blocking,
+        an irreversible one stays irreversible).
+        """
+        if self._secret_rules is None:
+            return entities
+        for match in self._secret_rules.analyze(text, ["SECRET"]):
+            value = text[match.start : match.end]
+            if _token_shaped(value) and any(
+                e.start <= match.start and match.end <= e.end for e in entities
+            ):
+                mapping.remember(value, match.entity_type)
+        copies: list[PIIEntity] = []
+        for value, entity_type in mapping.known_values().items():
+            start = text.find(value)
+            while start != -1:
+                end = start + len(value)
+                covered = any(
+                    e.entity_type == entity_type and e.start <= start and end <= e.end
+                    for e in entities
+                )
+                if not covered and _stands_alone(text, start, end):
+                    copies.append(PIIEntity(entity_type, value, start, end, 1.0, "known"))
+                start = text.find(value, end)
+        if not copies:
+            return entities
+        merged = entities + copies
+        return merge_entities(
+            merged,
+            overlap_resolution=self.config.overlap_resolution,
+            source_text=text,
+            type_priorities=self._type_priorities(merged),
+        )
+
+    async def _anonymize_content(self, content: Any, mapping: PIIMapping, language: str) -> Any:
+        if isinstance(content, str):
+            return await self._anonymize_text(content, mapping, language)
+        if content is None:
+            return content
+
+        # Multimodal parts: [{"type": "text", "text": ...}, {"type": "image_url", ...}]
+        if isinstance(content, list):
+            new_parts: list[Any] = []
+            for part in content:
+                if isinstance(part, str):
+                    # A bare string inside a content list is user text: scan it.
+                    # Skipping it let PII (and blocked types) through whenever a
+                    # client sent content as a plain string list.
+                    new_parts.append(await self._anonymize_text(part, mapping, language))
+                elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                    new_part = dict(part)
+                    new_part["text"] = await self._anonymize_text(part["text"], mapping, language)
+                    new_parts.append(new_part)
+                elif self._is_known_media_part(part):
+                    new_parts.append(part)
+                else:
+                    self._reject_if_strict(part)
+                    new_parts.append(part)
+            return new_parts
+
+        self._reject_if_strict(content)
+        return content
+
+    def _is_known_media_part(self, part: Any) -> bool:
+        # A media part (image/audio/...) carries no text to scrub, so passing it
+        # through is safe even in strict mode.
+        return isinstance(part, dict) and part.get("type") in _KNOWN_MEDIA_PART_TYPES
+
+    def _reject_if_strict(self, value: Any) -> None:
+        if self.config.strict:
+            raise UnsupportedContentError(
+                f"strict mode: content of type {type(value).__name__} cannot be inspected"
+            )
+
+    async def _anonymize_tool_calls(
+        self, tool_calls: Any, mapping: PIIMapping, language: str
+    ) -> Any:
+        if not isinstance(tool_calls, list):
+            return tool_calls
+
+        new_calls: list[Any] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                new_calls.append(call)
+                continue
+            new_call = dict(call)
+            function = call.get("function")
+            if isinstance(function, dict) and isinstance(function.get("arguments"), str):
+                new_function = dict(function)
+                new_function["arguments"] = await self._anonymize_arguments(
+                    function["arguments"], mapping, language
+                )
+                new_call["function"] = new_function
+            new_calls.append(new_call)
+        return new_calls
+
+    async def _anonymize_function_call(
+        self, function_call: Any, mapping: PIIMapping, language: str
+    ) -> Any:
+        if not isinstance(function_call, dict) or not isinstance(
+            function_call.get("arguments"), str
+        ):
+            return function_call
+        new_call = dict(function_call)
+        new_call["arguments"] = await self._anonymize_arguments(
+            function_call["arguments"], mapping, language
+        )
+        return new_call
+
+    async def _anonymize_arguments(self, arguments: str, mapping: PIIMapping, language: str) -> str:
+        try:
+            parsed = json.loads(arguments)
+        except (json.JSONDecodeError, ValueError):
+            # Arguments are not valid JSON: anonymize the raw string instead.
+            return await self._anonymize_text(arguments, mapping, language)
+        walked = await self._walk_anonymize(parsed, mapping, language)
+        return json.dumps(walked, ensure_ascii=False)
+
+    async def _walk_anonymize(self, value: Any, mapping: PIIMapping, language: str) -> Any:
+        if isinstance(value, str):
+            return await self._anonymize_text(value, mapping, language)
+        # bool is a subclass of int; leave true/false alone.
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            # A credit card or SSN sent as a bare JSON number would otherwise skip
+            # detection AND the block gate entirely. Scan the digits; only if PII is
+            # actually found does the leaf become a (masked) string, so ordinary
+            # numbers keep their type. The block gate still fires inside
+            # _anonymize_text for a blocked type. Numbers with fewer than 7 digits
+            # are skipped outright: the shortest realistic numeric PII (phone
+            # fragments, SSN, cards) is longer, and scanning every count/year/
+            # coordinate would run the full detector stack per leaf and risk
+            # rewriting schema-typed numbers on a false positive.
+            as_text = str(value)
+            if sum(ch.isdigit() for ch in as_text) < 7:
+                return value
+            anonymized = await self._anonymize_text(as_text, mapping, language)
+            return anonymized if anonymized != as_text else value
+        if isinstance(value, dict):
+            result: dict[Any, Any] = {}
+            for key, item in value.items():
+                result[key] = await self._walk_anonymize(item, mapping, language)
+            return result
+        if isinstance(value, list):
+            return [await self._walk_anonymize(item, mapping, language) for item in value]
+        return value
+
+    @inference_request
+    async def scrub_document(
+        self, value: Any, mapping: PIIMapping | None = None
+    ) -> tuple[Any, PIIMapping]:
+        """Anonymize an arbitrary JSON document (or bare string), for the gateway.
+
+        Public wrapper around the request walker so callers never touch the
+        private walkers. Every string leaf (and numeric leaf with >=7 digits)
+        still flows through the single choke point (_anonymize_text), including
+        the block_entities gate. Pass an existing mapping to share placeholders
+        across several subtrees of one request. Failure policy matches
+        process_request: only the safe policy errors cross this boundary, never
+        an exception that may carry raw input.
+        """
+        if mapping is None:
+            mapping = PIIMapping()
+        try:
+            return await self._walk_anonymize(value, mapping, self._language()), mapping
+        except (PIIBlockedError, UnsupportedContentError, PIIProcessingError):
+            raise
+        except Exception:
+            logger.error("PII document processing failed; request will be blocked")
+            raise PIIProcessingError() from None
+
+    async def gate_document(self, value: Any) -> None:
+        """Apply the block_entities gate to a document WITHOUT rewriting it.
+
+        For request fields that are deliberately relayed verbatim: the agent's
+        own prompt (Responses `instructions`, Anthropic `system`). An operator
+        who sets block_entities expects a hard stop on the whole REQUEST, not
+        only on the fields that get rewritten, so those fields are scanned for
+        the gate and the scrubbed copy is thrown away. The mapping is thrown
+        away with it, so nothing here can reach the relayed body or /stats.
+
+        No-op when no type is blocked: the default posture (`block_entities: []`)
+        pays no detection cost and relays exactly what it relayed before.
+
+        Raises PIIBlockedError when a blocked type is present, and the safe
+        PIIProcessingError on a detection failure (fail closed, same policy as
+        scrub_document).
+        """
+        if not self._blocked or not value:
+            return
+        await self.scrub_document(value)
+
+    def restore_document(self, value: Any, mapping: PIIMapping | None) -> Any:
+        """Restore originals in an arbitrary JSON document (or bare string).
+
+        Respects deanonymization.enabled. A restore failure raises the safe
+        PIIProcessingError: the mapping's originals must never reach a log via
+        an exception message.
+        """
+        if not self.config.deanonymization.enabled or mapping is None or mapping.is_empty:
+            return value
+        try:
+            return self._walk_deanonymize(value, mapping)
+        except Exception:
+            logger.error("PII document deanonymization failed")
+            raise PIIProcessingError() from None
+
+    async def inspect_text(self, text: str) -> list[PIIEntity]:
+        """Detections for one text, exactly as the request path would see them.
+
+        Returns the MERGED entity list (same merge strategy and overlap
+        resolution as `_anonymize_text`), so the result corresponds 1:1 with
+        what would be replaced. Read-only: nothing is anonymized, no mapping is
+        created, the block gate is not raised (callers report would-block types
+        instead). Powers the dry-run /v1/pii/inspect endpoint.
+        """
+        return (await self.inspect_text_detailed(text)).entities
+
+    async def inspect_text_detailed(self, text: str) -> DetectionReport:
+        """`inspect_text`, plus what `pii.allow_list` let through and what kept
+        a listed value redacted, so an operator can check an entry before
+        trusting it."""
+        if not text or not isinstance(text, str):
+            return DetectionReport([], [], [])
+        try:
+            return await self._detect_all_detailed(text, self._language())
+        except PIIProcessingError:
+            raise
+        except Exception:
+            logger.error("PII inspection failed")
+            raise PIIProcessingError() from None
+
+    async def process_response(self, content: str, mapping: PIIMapping) -> str:
+        if not self.config.deanonymization.enabled:
+            return content
+        try:
+            return self.deanonymizer.deanonymize(content, mapping)
+        except Exception:
+            # A restore failure can include the original value from the mapping.
+            logger.error("PII response deanonymization failed")
+            raise PIIProcessingError() from None
+
+    async def process_response_tool_calls(self, tool_calls: Any, mapping: PIIMapping | None) -> Any:
+        if (
+            not self.config.deanonymization.enabled
+            or mapping is None
+            or mapping.is_empty
+            or not isinstance(tool_calls, list)
+        ):
+            return tool_calls
+
+        try:
+            new_calls: list[Any] = []
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    new_calls.append(call)
+                    continue
+                new_call = dict(call)
+                function = call.get("function")
+                if isinstance(function, dict) and isinstance(function.get("arguments"), str):
+                    new_function = dict(function)
+                    new_function["arguments"] = self._deanonymize_arguments(
+                        function["arguments"], mapping
+                    )
+                    new_call["function"] = new_function
+                new_calls.append(new_call)
+            return new_calls
+        except Exception:
+            logger.error("PII tool-call deanonymization failed")
+            raise PIIProcessingError() from None
+
+    async def process_response_function_call(
+        self, function_call: Any, mapping: PIIMapping | None
+    ) -> Any:
+        if (
+            not self.config.deanonymization.enabled
+            or mapping is None
+            or mapping.is_empty
+            or not isinstance(function_call, dict)
+            or not isinstance(function_call.get("arguments"), str)
+        ):
+            return function_call
+        try:
+            new_call = dict(function_call)
+            new_call["arguments"] = self._deanonymize_arguments(function_call["arguments"], mapping)
+            return new_call
+        except Exception:
+            logger.error("PII function-call deanonymization failed")
+            raise PIIProcessingError() from None
+
+    def _deanonymize_arguments(self, arguments: str, mapping: PIIMapping) -> str:
+        try:
+            parsed = json.loads(arguments)
+        except (json.JSONDecodeError, ValueError):
+            return self.deanonymizer.deanonymize(arguments, mapping)
+        return json.dumps(self._walk_deanonymize(parsed, mapping), ensure_ascii=False)
+
+    def _walk_deanonymize(self, value: Any, mapping: PIIMapping) -> Any:
+        if isinstance(value, str):
+            return self.deanonymizer.deanonymize(value, mapping)
+        if isinstance(value, dict):
+            return {k: self._walk_deanonymize(v, mapping) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._walk_deanonymize(v, mapping) for v in value]
+        return value
+
+    def _detector_fingerprint(self) -> bytes:
+        """Fingerprint of everything that shapes a detection result, so a
+        configuration change can never serve stale cached spans. Recomputed on
+        every lookup (a few microseconds) rather than frozen at init: detectors
+        read parts of their config per call (e.g. score_threshold), so even an
+        in-place mutation of a live config must invalidate."""
+        cfg = self.config
+        payload = "\x1f".join(
+            (
+                cfg.detectors.model_dump_json(),
+                json.dumps([p.model_dump() for p in cfg.custom_patterns], sort_keys=True),
+                json.dumps([e.model_dump() for e in cfg.allow_list], sort_keys=True),
+                cfg.merge_strategy,
+                cfg.overlap_resolution,
+                self.anonymizer.config.model_dump_json(),
+                json.dumps(sorted(self._blocked)),
+            )
+        )
+        return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).digest()
+
+    async def _detect_all(self, text: str, language: str = "en") -> list[PIIEntity]:
+        return (await self._detect_all_detailed(text, language)).entities
+
+    async def _detect_all_detailed(self, text: str, language: str = "en") -> DetectionReport:
+        """`_detect_text`, at most `pii.max_concurrent_detections` at a time.
+
+        A text already in the cache does not wait. One that waited is looked up
+        again once it gets its turn, so requests that arrived together with the
+        same new text are served by the detection the first of them ran.
+        """
+        if self._detections is None or (
+            self._cache is not None
+            and self._cache.peek(self._cache.key(text, language, self._detector_fingerprint()))
+        ):
+            return await self._detect_text(text, language)
+        async with self._detections:
+            return await self._detect_text(text, language)
+
+    async def _detect_text(self, text: str, language: str = "en") -> DetectionReport:
+        """The merged detections to redact, with what pii.allow_list let
+        through. Every scanned surface and the inspect endpoint come through
+        here, so the list applies once, the same way, before the cache, the
+        propagation of known credentials, the block gate and the anonymizer."""
+        if not self.detectors:
+            return DetectionReport([], [], [])
+
+        cache = self._cache
+        cache_key: bytes | None = None
+        if cache is not None:
+            cache_key = cache.key(text, language, self._detector_fingerprint())
+            cached = cache.get(cache_key)
+            if cached is not None:
+                # Rebuild entities against the LIVE text: the cache stores span
+                # metadata only, never values. The block_entities gate and the
+                # anonymizer both run downstream on every request, cached or
+                # not, so a hit changes latency and nothing else.
+                return DetectionReport(*(entities_from_spans(spans, text) for spans in cached))
+
+        tasks = [detector.detect(text, language) for detector in self.detectors]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception:
+            logger.error("PII detector execution failed; request will be blocked")
+            raise PIIProcessingError() from None
+
+        all_entities: list[PIIEntity] = []
+        for result in results:
+            if isinstance(result, BaseException):
+                # Do not log or re-raise the original exception: detector
+                # libraries (and custom detectors) may put their input text in
+                # the message. The safe error keeps all callers fail-closed.
+                logger.error("PII detector failed; request will be blocked")
+                raise PIIProcessingError() from None
+            all_entities.extend(result)
+
+        try:
+            merged = merge_entities(
+                all_entities,
+                strategy=self.config.merge_strategy,
+                overlap_resolution=self.config.overlap_resolution,
+                source_text=text,
+                type_priorities=self._type_priorities(all_entities),
+            )
+            # Operator exemptions, on the merged result and against every raw
+            # detection under it (see privaite/pii/allow_list.py). A span with
+            # a detection the list does not cover stays whole.
+            verdict = apply_allow_list(
+                text, merged, all_entities, self._allow_rules, self._allow_protected
+            )
+        except Exception:
+            # merge_entities receives source_text for overlap resolution; keep
+            # its errors safe for the same reason as detector errors.
+            logger.error("PII detection result processing failed; request will be blocked")
+            raise PIIProcessingError() from None
+
+        # Only a fully successful merge is cached: any failure above raised, so
+        # an error can never be replayed as an empty (fail-open) result.
+        report = DetectionReport(verdict.redacted, verdict.allowed, verdict.not_allowed)
+        if cache is not None and cache_key is not None:
+            cache.put(
+                cache_key,
+                (
+                    spans_from_entities(report.entities),
+                    spans_from_entities(report.allowed),
+                    spans_from_entities(report.not_allowed),
+                ),
+            )
+        return report

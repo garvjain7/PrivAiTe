@@ -1,0 +1,26 @@
+# Dependabot, kept for the GitHub Actions only. The actions that build and
+# publish the package and the image are pinned by commit, and without this they
+# would never move. Python runtime dependencies are >= floors, so pip updates
+# only ever bumped the ruff pin; the weekly audit workflow is the safety net for
+# those. The Docker base digest is refreshed by hand at each release
+# (tests/test_docker_base.py): Dependabot's docker updates closed their only
+# proposal as up to date while the pinned base was three months old. No release
+# younger than 7 days is proposed (a compromised upstream release is usually
+# detected and yanked within days).
+# Docs: https://docs.github.com/code-security/dependabot/dependabot-version-updates
+version: 2
+updates:
+  # GitHub Actions pinned in the CI and publish workflows.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

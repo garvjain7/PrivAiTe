@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.venv/
+.venv*/
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+
+# Corpus text never lands in the repo: raw downloads and selected documents live
+# in ~/.cache/privaite-bench. results/runs/ holds offsets and booleans only.
+
+# Agent workflow benchmark runtime artifacts: the generated fake secrets and
+# the raw provider-bound request captures (they contain those secrets).
+agent_workflow/fixtures/acme_support/.env
+results/agent_workflow/
+results/agent_workflow_big/
+
+# Harness stdout logs from live runs (cited by RESULTS*.md for provenance, kept local)
+results/*.log
+.coverage
+.coverage.*

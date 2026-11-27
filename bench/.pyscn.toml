@@ -1,0 +1,40 @@
+# pyscn configuration for privaite-bench.
+#
+# pbench/ is the harness; pbench/systems/ are the adapters that run inside each
+# system's own virtualenv. Adapters may use only their stdlib helpers (_common and
+# the shared private modules), never the harness, because the harness's
+# dependencies are not installed in their environments.
+
+[architecture]
+enabled = true
+validate_layers = true
+strict_mode = true
+
+[[architecture.layers]]
+name = "systems"
+packages = ["pbench.systems"]
+
+[[architecture.layers]]
+name = "harness"
+packages = ["pbench"]
+
+[[architecture.layers]]
+name = "agent_workflow"
+packages = ["agent_workflow"]
+
+[[architecture.rules]]
+from = "harness"
+allow = ["harness", "systems"]
+
+[[architecture.rules]]
+from = "systems"
+allow = ["systems"]
+
+[[architecture.rules]]
+from = "agent_workflow"
+allow = ["agent_workflow"]
+
+# Clone detection: flag only real copy-paste (type-1 identical, type-2 renamed).
+[clones]
+min_lines = 10
+enabled_clone_types = ["type1", "type2"]

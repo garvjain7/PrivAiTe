@@ -1,0 +1,203 @@
+"""Pins for the generated documentation artefacts.
+
+`llms-full.txt` is a concatenation of the README and the docs pages, so it goes
+stale the moment a page is edited: it once shipped three releases behind. These
+tests turn that into a failing gate instead of a silent drift.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+GENERATOR = REPO_ROOT / "scripts" / "gen_llms_full.py"
+
+
+def _load_generator():
+    spec = importlib.util.spec_from_file_location("gen_llms_full", GENERATOR)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_llms_full_matches_the_sources_it_concatenates() -> None:
+    generator = _load_generator()
+    assert generator.OUTPUT.read_text() == generator.render(), (
+        "llms-full.txt is stale, run scripts/gen_llms_full.py"
+    )
+
+
+def test_llms_txt_and_its_docs_copy_are_identical() -> None:
+    root_copy = (REPO_ROOT / "llms.txt").read_text()
+    docs_copy = (REPO_ROOT / "docs" / "llms.txt").read_text()
+    assert root_copy == docs_copy
+
+
+def test_llms_txt_announces_the_shipped_versions() -> None:
+    """llms.txt states the current release in prose, and prose is invisible to the
+    concatenation check: it sat on 0.4.0 / filter 0.1.8 for a whole release while
+    `gen_llms_full.py --check` reported everything up to date. This is the file
+    whose entire purpose is being read by assistants, so a stale version there is
+    the one that gets quoted back at people."""
+    import re
+
+    text = (REPO_ROOT / "llms.txt").read_text()
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text()
+    shipped = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
+    assert shipped is not None
+    package_version = shipped.group(1)
+
+    filter_src = (REPO_ROOT / "integrations" / "openwebui" / "privaite_filter.py").read_text()
+    filter_match = re.search(r"^version: (\S+)", filter_src, re.MULTILINE)
+    assert filter_match is not None
+    filter_version = filter_match.group(1)
+
+    assert f"Source version: privaite {package_version}" in text, (
+        f"llms.txt does not announce the shipped package version {package_version}"
+    )
+    assert f"current source privaite {package_version}" in text
+    assert f"filter v{filter_version}" in text, (
+        f"llms.txt does not announce the shipped filter version {filter_version}"
+    )
+    assert f"Filter Function (v{filter_version})" in text
+
+    # No older version may linger anywhere in the file.
+    announced = set(re.findall(r"privaite (\d+\.\d+\.\d+)", text))
+    stale = {v for v in announced if v != package_version}
+    assert not stale, f"llms.txt still mentions superseded versions: {sorted(stale)}"
+
+
+@pytest.mark.parametrize("rel", ["docs/agent-leak-measurement.md", "docs/gateway.md"])
+def test_historical_miss_measurements_keep_the_original_mechanism(rel: str) -> None:
+    """Fixes must not rewrite the original live evidence. The current detection
+    docs describe the fix; these pages retain the measured historical behavior."""
+    text = (REPO_ROOT / rel).read_text()
+    assert "preceding line of log-shaped context" in text
+    assert "order dependent" in text
+
+
+def test_historical_gateway_docs_keep_cross_surface_reach_and_measurements() -> None:
+    text = (REPO_ROOT / "docs" / "gateway.md").read_text()
+    assert "order dependent" in text
+    assert "4 of 5 and 3 of 5" in text
+    for surface in ("OpenAI-compatible proxy", "Open WebUI filter", "LiteLLM guardrail"):
+        assert surface in text
+
+
+def test_readme_links_are_absolute() -> None:
+    """The README is rendered on PyPI and Docker Hub, where a relative link is
+    dead. Every link must be absolute, in-page anchors included."""
+    import re
+
+    text = (REPO_ROOT / "README.md").read_text()
+    relative = [
+        target
+        for target in re.findall(r"\]\(([^)]+)\)", text)
+        if not target.startswith(("http://", "https://", "mailto:"))
+    ]
+    assert relative == []
+
+
+def test_openwebui_filter_floor_matches_the_shipped_version() -> None:
+    """An Open WebUI environment on an older privaite is never upgraded, so the
+    declared floor has to track the release."""
+    from privaite import __version__
+
+    filter_source = (REPO_ROOT / "integrations" / "openwebui" / "privaite_filter.py").read_text()
+    readme = (REPO_ROOT / "integrations" / "openwebui" / "README.md").read_text()
+    assert f"requirements: privaite>={__version__}" in filter_source
+    assert f"privaite>={__version__}" in readme
+
+
+def test_no_install_instruction_points_at_a_superseded_version() -> None:
+    """A reader who follows the README literally must land on the shipped release.
+
+    The release checklist bumps the package and the integration pins; the quick
+    start's docker tag and pip floor are easy to leave a release behind.
+    """
+    import re
+
+    from privaite import __version__
+
+    pages = [REPO_ROOT / "README.md", REPO_ROOT / "llms.txt"]
+    pages += sorted((REPO_ROOT / "docs").glob("*.md"))
+    pages += sorted((REPO_ROOT / "integrations").glob("*/README.md"))
+
+    # Only install targets: a docker tag or a pip specifier. Prose naming an
+    # older version in a historical measurement is deliberate and stays.
+    target = re.compile(r"privaite[:>=]=?(\d+\.\d+\.\d+)")
+    stale: list[str] = []
+    for page in pages:
+        for version in set(target.findall(page.read_text())):
+            if version != __version__:
+                stale.append(f"{page.relative_to(REPO_ROOT)} -> {version}")
+    assert not stale, f"install instructions on a superseded version: {sorted(stale)}"
+
+
+def test_files_downloaded_by_the_docs_come_from_the_shipped_tag() -> None:
+    """The quick start downloads the shipped config from raw.githubusercontent.com.
+
+    A link to `main` hands a pip user the config of whatever is being developed,
+    and a link to an older tag hands them the previous release's. The version
+    regex above cannot see either: it only reads docker tags and pip specifiers.
+    """
+    import re
+
+    from privaite import __version__
+
+    pages = [REPO_ROOT / "README.md", REPO_ROOT / "llms.txt"]
+    pages += sorted((REPO_ROOT / "docs").glob("*.md"))
+    pages += sorted((REPO_ROOT / "integrations").glob("*/README.md"))
+
+    ref = re.compile(r"raw\.githubusercontent\.com/crp4222/PrivAiTe/([^/\s)]+)/config/")
+    wrong = [
+        f"{page.relative_to(REPO_ROOT)} -> {found}"
+        for page in pages
+        for found in ref.findall(page.read_text())
+        if found != f"v{__version__}"
+    ]
+    assert not wrong, f"config downloaded from another ref than v{__version__}: {wrong}"
+    assert ref.search((REPO_ROOT / "README.md").read_text()), "the quick start lost its config link"
+
+
+def test_nothing_is_still_announced_as_unreleased() -> None:
+    """Prose calling shipped behaviour "unreleased" reads as "not available yet"."""
+    pages = [REPO_ROOT / "README.md", REPO_ROOT / "llms.txt"]
+    pages += sorted((REPO_ROOT / "docs").glob("*.md"))
+    offenders = [
+        str(p.relative_to(REPO_ROOT)) for p in pages if "unreleased" in p.read_text().lower()
+    ]
+    assert offenders == [], f"still announced as unreleased: {offenders}"
+
+
+@pytest.mark.parametrize("rel", ["README.md", "docs/index.md", "integrations/openwebui/README.md"])
+def test_filter_docs_say_task_calls_need_the_proxy(rel: str) -> None:
+    """Open WebUI generates titles, tags and follow-ups without running any
+    filter, so with a cloud model the filter alone sends the chat text out on
+    those calls. Every page offering the filter says so and names the proxy,
+    which sees them because they go through the same connection."""
+    import re
+
+    text = " ".join((REPO_ROOT / rel).read_text().split())
+    note = re.search(r"title, tag and follow-up[^.]*\.[^.]*\.", text)
+    assert note, f"{rel} does not say the filter misses title, tag and follow-up calls"
+    assert "proxy" in note.group(0), f"{rel} does not point those calls at the proxy"
+
+
+def test_docs_announce_the_shipped_onnx_variant() -> None:
+    """Both variants are documented with their measured difference; the page has
+    to name the default the code actually ships."""
+    from privaite.config.schema import OnnxDetectorConfig
+
+    default = OnnxDetectorConfig().onnx_variant
+    configuration = (REPO_ROOT / "docs" / "configuration.md").read_text()
+    detection = (REPO_ROOT / "docs" / "detection.md").read_text()
+    assert f"`onnx_variant` defaults to `{default}`" in configuration
+    assert "`q4f16`" in configuration
+    assert f"`{default}` (default)" in detection

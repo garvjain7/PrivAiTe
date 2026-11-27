@@ -1,0 +1,231 @@
+"""Pin the CLI surface: options, echo strings, config plumbing and exit codes.
+
+The CLI is what every quickstart runs first; a changed flag or startup line is
+a behavior change and must show up here.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+from click.testing import CliRunner
+
+import privaite.cli as cli_module
+from privaite.cli import main
+from privaite.config.schema import (
+    LiteLLMParams,
+    PIIConfig,
+    PrivAiTeConfig,
+    ProviderConfig,
+    ServerConfig,
+)
+
+
+@pytest.fixture
+def fake_boot(monkeypatch):
+    """Stub load_config and uvicorn.run, capturing what the CLI does with them."""
+    calls: dict = {}
+
+    config = PrivAiTeConfig(
+        server=ServerConfig(host="0.0.0.0", port=8400, workers=1, log_level="info"),
+        providers=[
+            ProviderConfig(
+                model_name="test-model",
+                litellm_params=LiteLLMParams(model="openai/gpt-4o-mini"),
+            )
+        ],
+        pii=PIIConfig(enabled=True),
+    )
+
+    def fake_load_config(path):
+        calls["config_path"] = path
+        return config
+
+    def fake_run(app, **kwargs):
+        calls["app"] = app
+        calls["run_kwargs"] = kwargs
+
+    monkeypatch.setattr(cli_module, "load_config", fake_load_config)
+    monkeypatch.setattr(cli_module.uvicorn, "run", fake_run)
+    monkeypatch.delenv("PRIVAITE_CONFIG_PATH", raising=False)
+    calls["config"] = config
+    return calls
+
+
+def test_help_lists_every_option():
+    result = CliRunner().invoke(main, ["--help"])
+    assert result.exit_code == 0
+    assert "--config" in result.output
+    assert "Path to config YAML file" in result.output
+    assert "--host" in result.output
+    assert "Override server host" in result.output
+    assert "--port" in result.output
+    assert "Override server port" in result.output
+    assert "--reload" in result.output
+    assert "Auto-reload on file changes (dev mode)" in result.output
+
+
+def test_startup_echo_and_uvicorn_wiring(fake_boot):
+    result = CliRunner().invoke(main, [])
+
+    assert result.exit_code == 0
+    assert "Starting PrivAiTe on 0.0.0.0:8400" in result.output
+    assert "PII processing: enabled" in result.output
+    assert "Providers: 1 configured" in result.output
+    assert "Auto-reload enabled" not in result.output
+
+    assert fake_boot["app"] == "privaite.app:create_app"
+    kwargs = fake_boot["run_kwargs"]
+    assert kwargs["host"] == "0.0.0.0"
+    assert kwargs["port"] == 8400
+    assert kwargs["workers"] == 1
+    assert kwargs["log_level"] == "info"
+    assert kwargs["factory"] is True
+    assert kwargs["reload"] is False
+    assert kwargs["reload_dirs"] is None
+
+
+def test_pii_disabled_is_echoed(fake_boot):
+    fake_boot["config"].pii.enabled = False
+    result = CliRunner().invoke(main, [])
+    assert result.exit_code == 0
+    assert "PII processing: disabled" in result.output
+
+
+def test_host_and_port_options_override_config(fake_boot):
+    result = CliRunner().invoke(main, ["--host", "127.0.0.1", "--port", "8452"])
+
+    assert result.exit_code == 0
+    assert "Starting PrivAiTe on 127.0.0.1:8452" in result.output
+    assert fake_boot["run_kwargs"]["host"] == "127.0.0.1"
+    assert fake_boot["run_kwargs"]["port"] == 8452
+
+
+def test_config_path_reaches_loader_and_worker_env(fake_boot, monkeypatch):
+    # uvicorn re-imports create_app() in the worker process, so the path must
+    # travel through PRIVAITE_CONFIG_PATH, not just this process's variable.
+    result = CliRunner().invoke(main, ["--config", "some.yaml"])
+
+    assert result.exit_code == 0
+    assert fake_boot["config_path"] == "some.yaml"
+    import os
+
+    assert os.environ.get("PRIVAITE_CONFIG_PATH") == "some.yaml"
+    monkeypatch.delenv("PRIVAITE_CONFIG_PATH", raising=False)
+
+
+def test_no_config_flag_leaves_env_untouched(fake_boot):
+    import os
+
+    result = CliRunner().invoke(main, [])
+    assert result.exit_code == 0
+    assert fake_boot["config_path"] is None
+    assert "PRIVAITE_CONFIG_PATH" not in os.environ
+
+
+def test_reload_flag_echoes_and_wires_reload_dirs(fake_boot):
+    result = CliRunner().invoke(main, ["--reload"])
+
+    assert result.exit_code == 0
+    assert "Auto-reload enabled (dev mode)" in result.output
+    assert fake_boot["run_kwargs"]["reload"] is True
+    assert fake_boot["run_kwargs"]["reload_dirs"] == ["privaite", "config"]
+
+
+def test_non_integer_port_is_a_usage_error(fake_boot):
+    result = CliRunner().invoke(main, ["--port", "not-a-port"])
+    assert result.exit_code == 2
+    assert "run_kwargs" not in fake_boot  # the server never started
+
+
+def test_unknown_option_is_a_usage_error(fake_boot):
+    result = CliRunner().invoke(main, ["--bogus"])
+    assert result.exit_code == 2
+    assert "run_kwargs" not in fake_boot
+
+
+def test_the_documented_quickstart_still_starts_the_server(fake_boot):
+    """`python -m privaite --config x.yaml` is in every README, Dockerfile and
+    compose file in the wild. Adding a subcommand must not turn it into an error."""
+    result = CliRunner().invoke(main, ["--config", "some.yaml"])
+    assert result.exit_code == 0
+    assert "Starting PrivAiTe on" in result.output
+
+
+def test_verify_is_exposed_as_a_subcommand():
+    result = CliRunner().invoke(main, ["--help"])
+    assert result.exit_code == 0
+    assert "verify" in result.output
+
+    help_text = CliRunner().invoke(main, ["verify", "--help"])
+    assert help_text.exit_code == 0
+    assert "--preset" in help_text.output
+    assert "--json" in help_text.output
+
+
+def test_verify_exits_non_zero_when_something_leaked(monkeypatch):
+    """It is meant to be usable as a gate, so a leak must not exit 0."""
+    from privaite import verify as verify_module
+    from privaite.verify import PLANTED, Finding, VerificationResult
+
+    def fake_verify(preset: str = "onnx") -> VerificationResult:
+        return VerificationResult(
+            preset=preset,
+            direct=[Finding(v, t, w, on_the_wire=True) for v, t, w in PLANTED],
+            through_proxy=[Finding(v, t, w, on_the_wire=True) for v, t, w in PLANTED],
+            placeholders=[],
+            restored=True,
+            elapsed_ms=1.0,
+        )
+
+    monkeypatch.setattr(verify_module, "verify", fake_verify)
+    result = CliRunner().invoke(main, ["verify", "--preset", "light"])
+    assert result.exit_code == 1
+    assert "FAILED" in result.output
+
+    as_json = CliRunner().invoke(main, ["verify", "--preset", "light", "--json"])
+    payload = json.loads(as_json.output)
+    assert {"elapsed_ms", "startup_ms", "request_ms"} <= payload.keys()
+
+
+def test_verify_announces_the_size_of_the_default_model_download(monkeypatch):
+    """The default q4 variant is ~917 MB on disk; the notice must not undersell
+    the first-run download."""
+    from privaite import verify as verify_module
+    from privaite.verify import PLANTED, Finding, VerificationResult
+
+    def fake_verify(preset: str = "onnx") -> VerificationResult:
+        return VerificationResult(
+            preset=preset,
+            direct=[Finding(v, t, w, on_the_wire=True) for v, t, w in PLANTED],
+            through_proxy=[Finding(v, t, w, on_the_wire=False) for v, t, w in PLANTED],
+            placeholders=[],
+            restored=True,
+            elapsed_ms=1.0,
+        )
+
+    monkeypatch.setattr(verify_module, "verify", fake_verify)
+    result = CliRunner().invoke(main, ["verify"])
+    assert "Using preset onnx; the detection model downloads once (~900 MB)." in result.output
+
+
+@pytest.mark.parametrize(("preset", "size"), [("minilm", "~490 MB"), ("ultrafast", "~250 MB")])
+def test_verify_announces_the_minilm_download(monkeypatch, preset, size):
+    """onnx/model.onnx or the Core ML package, plus the tokenizer (17 MB)."""
+    from privaite import verify as verify_module
+    from privaite.verify import PLANTED, Finding, VerificationResult
+
+    def fake_verify(preset: str = "onnx") -> VerificationResult:
+        return VerificationResult(
+            preset=preset,
+            direct=[Finding(v, t, w, on_the_wire=True) for v, t, w in PLANTED],
+            through_proxy=[Finding(v, t, w, on_the_wire=False) for v, t, w in PLANTED],
+            placeholders=[],
+            restored=True,
+            elapsed_ms=1.0,
+        )
+
+    monkeypatch.setattr(verify_module, "verify", fake_verify)
+    result = CliRunner().invoke(main, ["verify", "--preset", preset])
+    assert f"Using preset {preset}; the detection model downloads once ({size})." in result.output

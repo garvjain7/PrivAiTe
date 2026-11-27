@@ -1,0 +1,118 @@
+from __future__ import annotations
+
+import re
+from difflib import SequenceMatcher
+
+from privaite.config.schema import DeanonymizationConfig
+from privaite.pii.mapping import PIIMapping
+
+# An intact-but-unknown placeholder (e.g. the model hallucinated <PERSON_3> when
+# only <PERSON_1> exists). Fuzzy-matching it to a KNOWN placeholder would inject
+# someone else's PII, so these candidates are never fuzzy-replaced. Checked
+# case-insensitively on the punctuation-stripped core, so "<person_3>," is
+# protected just like "<PERSON_3>".
+_PLACEHOLDER_SHAPE = re.compile(r"<[A-Z][A-Z0-9_]*_\d+>\Z", re.IGNORECASE)
+
+# Sentence punctuation stripped from candidate edges before matching, so a
+# trailing comma neither defeats the placeholder guard nor gets swallowed by a
+# legitimate replacement. Deliberately excludes <> (placeholders) and the
+# @._+- characters that appear inside emails, phones and dates.
+_EDGE_PUNCT = ".,;:!?\"'()[]{}«»…"
+
+
+class DeAnonymizer:
+    def __init__(self, config: DeanonymizationConfig) -> None:
+        self.config = config
+
+    def deanonymize(self, text: str, mapping: PIIMapping) -> str:
+        if mapping.is_empty:
+            return text
+
+        if self.config.fuzzy_matching:
+            return self._deanonymize_fuzzy(text, mapping)
+
+        return self._deanonymize_exact(text, mapping)
+
+    def _deanonymize_exact(self, text: str, mapping: PIIMapping) -> str:
+        # One pass, longest fake first at each position, like the streaming
+        # restorer. Replacing fake by fake chained substitutions: an input
+        # literal "<PERSON_2>" sent as "<PERSON_10>" came back as "<PERSON_2>"
+        # and was then rewritten again into the real value behind "<PERSON_2>".
+        fakes = {fake: original for fake, original in mapping.get_all_fakes().items() if fake}
+        if not fakes:
+            return text
+        pattern = re.compile("|".join(re.escape(f) for f in sorted(fakes, key=len, reverse=True)))
+        return pattern.sub(lambda m: fakes[m.group(0)], text)
+
+    def _deanonymize_fuzzy(self, text: str, mapping: PIIMapping) -> str:
+        text = self._deanonymize_exact(text, mapping)
+
+        fakes = mapping.get_all_fakes()
+        if not fakes:
+            return text
+
+        # Token spans over the REAL text. Replacements are applied by slicing the
+        # original string, so every untouched character (newlines, indentation,
+        # inner punctuation) survives verbatim. Rebuilding via split()/join() here
+        # once flattened all whitespace in every response that carried PII.
+        tokens = [(m.start(), m.end()) for m in re.finditer(r"\S+", text)]
+        if not tokens:
+            return text
+
+        known_fakes = set(fakes)
+        replacements: list[tuple[int, int, str]] = []
+
+        def _overlaps(start: int, end: int) -> bool:
+            return any(s < end and start < e for s, e, _ in replacements)
+
+        for fake in sorted(fakes, key=len, reverse=True):
+            original = fakes[fake]
+            window = len(fake.split())
+            if window == 0:
+                continue
+
+            for i in range(len(tokens) - window + 1):
+                span = self._fuzzy_edge_match(
+                    text, tokens[i][0], tokens[i + window - 1][1], fake, original, known_fakes
+                )
+                if span is not None and not _overlaps(*span):
+                    replacements.append((span[0], span[1], original))
+
+        for start, end, original in sorted(replacements, reverse=True):
+            text = text[:start] + original + text[end:]
+
+        return text
+
+    def _fuzzy_edge_match(
+        self,
+        text: str,
+        raw_start: int,
+        raw_end: int,
+        fake: str,
+        original: str,
+        known_fakes: set[str],
+    ) -> tuple[int, int] | None:
+        """Trim sentence punctuation off a token window and, if the core slice
+        fuzzily matches ``fake`` over the threshold, return its (start, end); else
+        None. The core is skipped when it is the real value, an exact fake, or a
+        placeholder shape ("Michel Deu," keeps its comma; "<PERSON_3>." stays a
+        placeholder). Whitespace is normalized before scoring so a fake re-typed
+        across a newline or double space still matches instead of paying a ratio
+        penalty per whitespace char."""
+        start, end = raw_start, raw_end
+        while start < end and text[start] in _EDGE_PUNCT:
+            start += 1
+        while end > start and text[end - 1] in _EDGE_PUNCT:
+            end -= 1
+        if start >= end:
+            return None
+        candidate = text[start:end]
+        if candidate == original or candidate in known_fakes:
+            return None
+        if _PLACEHOLDER_SHAPE.match(candidate):
+            return None
+        normalized = " ".join(candidate.split())
+        ratio = SequenceMatcher(None, normalized.lower(), fake.lower()).ratio()
+        if ratio >= self.config.fuzzy_threshold:
+            return (start, end)
+        return None

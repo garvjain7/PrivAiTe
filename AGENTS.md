@@ -1,0 +1,312 @@
+# PrivAiTe, guide for AI agents (read this before changing code)
+
+PrivAiTe is a self-hosted, OpenAI-compatible proxy that **detects PII, replaces it
+with reversible placeholders before forwarding to the LLM provider, and restores
+the real values in the response.** It is a privacy tool: a single leak defeats its
+purpose. The rules below each exist because breaking them caused a real bug. Treat
+them as invariants, not suggestions.
+
+## Non-negotiable invariants
+
+1. **Fail closed.** If detection/anonymization raises, the request is **blocked**,
+   never forwarded. `pii.on_error` defaults to `"block"`; detector exceptions
+   re-raise (`engine._detect_all`). Do not add a fallback that forwards raw text on
+   error. Startup refuses unsafe configs (see #6).
+2. **One choke point.** Every piece of user text reaches the provider only through
+   `PIIEngine._anonymize_text`. The `block_entities` gate lives there. If you add a
+   new field/path that carries user text, route it through the engine, never
+   forward it directly.
+3. **Restore parity.** Whatever is anonymized must be restored on the way back, in
+   **both streaming and non-streaming**: `content`, `tool_calls[].function.arguments`,
+   legacy `function_call.arguments`, `reasoning_content`/`reasoning`, `refusal`,
+   and the audio `transcript`.
+4. **`mask` and `redact` are irreversible.** They must NOT enter the reversible
+   mapping (`mapping.note()`, not `mapping.add()`). Two values that mask to the same
+   string must never cross-restore. Only `placeholder` and `fake_replacement` are
+   reversible.
+5. **Never log or echo PII.** Errors name entity **types**, never values
+   (`PIIBlockedError`, `UnsupportedContentError`). No logger call may emit message
+   content or entity values. The reversible map is per-request, in-memory only.
+   The opt-in detection cache (`privaite/pii/cache.py`) may hold only salted
+   hashes and span metadata (offsets, types, scores, sources): never text,
+   values, anonymized output, or mapping state. Its privacy delta is documented
+   in `docs/threat-model.md` (the README threat model is the short version and
+   links to it); keep that page in sync if you touch it.
+6. **Startup fails fast on unsafe config**, it never degrades silently: `pii.enabled`
+   with 0 detectors, `merge_strategy: intersection` with <2 detectors, a Presidio
+   language with no spaCy model, duplicate provider `model_name` aliases, and a
+   `block_entities` type no enabled detector can emit (conservative check: skipped
+   when a detector's producible set is unknown) all raise at boot.
+7. **Config defaults are the safety posture, do not flip them casually.**
+   `preset: onnx` (72.7% of direct identifiers on the README benchmark), `on_error: block`,
+   `deanonymization.fuzzy_matching: false` (fuzzy can mis-substitute), detector
+   `trust_remote_code: false`, `block_entities: []`.
+8. **An issued placeholder never equals a string already in the request.** The
+   restore replaces every occurrence, so a pre-existing `<PERSON_1>` (a fixture,
+   a template, a planted `?to=<EMAIL_ADDRESS_1>`) would receive a real value.
+   `PIIMapping.reserve` runs over the whole request before the first placeholder
+   is issued (`_process_request` with `other_fields`, both gateway scrubs), the
+   anonymizer swaps a literal that shows up too late (`_shield_literals`), and
+   the restore is single-pass. A new path that shares one mapping across several
+   calls must reserve the whole body first.
+9. **Nothing phones home.** The only outbound request is the one to the
+   provider. Dependencies do not respect that by default: ONNX Runtime 1.29+
+   uploads telemetry to Microsoft, LiteLLM fetches a price table from GitHub,
+   the Hub is asked about cached files, tldextract downloads the public suffix
+   list. `privaite/__init__.py` switches the first three off before they load,
+   the ONNX and Presidio detectors handle the rest, and the Dockerfile repeats
+   the switches. `tests/test_outbound.py` pins each one, but only a packet
+   capture on the built image sees a new one: run it when a dependency floor
+   moves (a container sharing the image's network namespace, `tcpdump` on port
+   53 and on outgoing SYNs, then `privaite verify` and a proxy start).
+
+## What is and isn't scanned (know the surface)
+
+Scanned: `messages[].content` (string, multimodal text parts, or bare strings in a
+list); plaintext `messages[].reasoning_content`, `reasoning`, `refusal` and
+`audio.transcript` (clients can echo restored response fields on the next turn);
+`tool_calls`/`function_call` arguments parsed as JSON and scrubbed value by
+value **including numeric leaves with >=7 digits** (a card number sent as a bare
+number is caught); `/v1/completions` `prompt` and `suffix`; `/v1/embeddings`
+`input`; chat `prediction.content` and `web_search_options.user_location`
+(auxiliary request fields, scrubbed input-side via `process_request_value`, no
+restore path needed).
+
+A credential the structured secret rules matched is `SECRET` in every text
+scrubbed after it in the same request (`PIIEngine._with_known_values`, at the
+choke point, so both scrub surfaces get it). Re-detecting a credential the client
+echoes back is not reliable: an agent repeats a restored password bare, in its
+reasoning or in the next command. The values live in `PIIMapping.remember`, apart
+from the per-value type, which a later detection of the same string under
+another type overwrites (that overwrite silently stopped the propagation once).
+A copy goes through the normal overlap resolution, so a blocked type still
+blocks and an irreversible one stays irreversible. Keep it narrow: rule-matched
+values only (propagating what the ONNX model labels `SECRET` copied a plugin
+name 24 times in one Codex session), 8 characters minimum with a digit, exact
+copies, forward only.
+
+NOT scanned (documented limitation, keep it documented if you change it):
+`messages[].name`, top-level `user`/`metadata`, `tools`/`functions` definitions,
+JSON object keys, and tokenized (integer-array) inputs.
+
+Forwarded at all: only the OpenAI parameters of each endpoint
+(`CHAT_PARAMS`, `COMPLETION_PARAMS`, `EMBEDDING_PARAMS` in
+`privaite/api/pipeline.py`) plus a provider's `forward_params`; anything else
+is a 400 before the scan. Every forwarded field becomes a litellm keyword
+argument, and litellm reads call settings from those: a client `api_base` sent
+the operator's key to the client's server, `extra_body.messages` replaced the
+anonymized messages. Never forward the body wholesale, and never let
+`forward_params` take a call setting (the schema refuses them at load).
+
+`POST /v1/pii/inspect` (off by default, `pii.inspect.enabled`) is a dry run: it
+returns the caller's own detections + anonymized preview and forwards NOTHING.
+It is the one deliberate exception to "never echo values" (the caller sent the
+text; invariant #5 still fully applies to logs, errors and /stats, and the
+endpoint module deliberately has no logger). Keep it excluded from /stats.
+
+## Gateway: the SECOND scrub surface (`privaite/gateway/`)
+
+Opt-in agent CLI routes (`gateway.enabled`, off by default): `/v1/messages`,
+`/v1/messages/count_tokens` (Anthropic Messages, Claude Code) and `/v1/responses`
+(OpenAI Responses, Codex, beta). They are a **parallel request path** to
+`privaite/api/`: a core-side fix (a new scanned field, a new restored field, a
+gate) is NOT automatically true here. Check both.
+
+- **Scrub (`gateway/scrub.py`)** still goes through the one choke point: every
+  scanned string reaches `PIIEngine.scrub_document` (hence `_anonymize_text`),
+  so `block_entities` and fail-closed apply unchanged. Rules that exist because
+  breaking them leaked: scrub coverage must match restore coverage (restore
+  rewrites every string leaf, so the client holds REAL values inside
+  `server_tool_use`/`mcp_tool_use` blocks and echoes them back next turn: scrub
+  them); tool OUTPUT carriers are where a file the agent read arrives
+  (`custom_tool_call_output` and friends, a list of `{type,text}` parts, not
+  just a string); an Anthropic block type this build does not know is scanned
+  through an allowlist of plaintext field names, never relayed raw. Relayed
+  byte-for-byte: `thinking`/`redacted_thinking`, binary and opaque payloads,
+  and the Responses opaque item types. The agent's own prompt (`system`,
+  `instructions`) is the one field read but not rewritten: it goes through
+  `PIIEngine.gate_document`, so `block_entities` still rejects the request while
+  the prompt reaches the provider verbatim. The exact frozensets are documented
+  in `docs/gateway.md` and pinned by `tests/test_gateway/test_gateway_docs.py`:
+  change one, change the other.
+- **Restore (`gateway/restore.py`)** is NOT the core restore. `restore_tree`
+  rewrites **every string leaf** of the response except blocks whose type is in
+  the protocol's `skip_restore_types` (thinking, encrypted reasoning/compaction),
+  and an `arguments` string is restored on its PARSED tree and re-encoded, never
+  by plain substitution (splicing a raw quote/backslash/newline back into a JSON
+  string literal breaks the client's `json.loads`).
+- **A separate SSE restorer** lives here too (`_SSERestorer`), driven by the
+  declarative event plans in `gateway/protocols.py`: one `StreamingDeAnonymizer`
+  per text channel so a placeholder split across two events still restores, a
+  flush at channel end and at `[DONE]` so held-back text is never dropped, and
+  `json_escaped_mapping` on JSON-fragment channels (streamed tool arguments) so
+  the spliced original stays a valid piece of the JSON string literal it lands
+  in. Upstream framing (event names, comments, `[DONE]`) is preserved verbatim.
+- **Relay (`gateway/relay.py`)**: `accept-encoding` is never forwarded (the
+  proxy must be able to decode what comes back), duplicate header names are
+  relayed verbatim as a list of pairs, an upstream timeout maps to 504 and a
+  transport failure to 502.
+- **Auth**: gateway paths are deliberately skipped by `AuthMiddleware` when
+  gateway mode is on (the only credential in the request is the client's own
+  upstream token). With the default `server.host: 0.0.0.0` and no rate limit,
+  an exposed port plus gateway mode is an open endpoint. Documented in
+  `docs/gateway.md`; do not "fix" it silently in either direction.
+  `GET /v1/models` is shared with the core proxy: in gateway mode the middleware
+  only flags whether the caller holds a valid PrivAiTe key, and the route serves
+  PrivAiTe's list to that caller and relays everyone else to the Responses
+  upstream (Codex needs its upstream catalog). A valid PrivAiTe key never
+  leaves; with auth disabled the route always relays.
+
+## Streaming handler (`privaite/streaming/handler.py`)
+
+Forward the provider's own chunks (preserve `id`, `usage`, `logprobs`, and the real
+finish chunk: do not synthesize a duplicate finish). One restore buffer **per
+choice index** (n>1 must not share). Flush held-back text onto the finish chunk and
+again after the stream ends without a `finish_reason`. Never suppress a chunk that
+carries any payload other than fully-held-back content.
+
+## Before you push or release
+
+- Run in the repo venv (`.venv`): `pytest`, `ruff check`, `ruff format --check`,
+  and **`mypy privaite/ integrations/openwebui/privaite_filter.py integrations/litellm/privaite_guardrail.py`**.
+  Both the push CI and the publish workflow type-check the integrations:
+  skipping them locally once broke a release.
+- Version: bump **both** `pyproject.toml` and `privaite/__init__.py`; date the
+  `CHANGELOG.md` section; bump the integration pins (`privaite>=X`).
+- Install instructions: every docker tag, pip floor and sentence describing a
+  behaviour as not yet shipped moves with the release, or the quick start
+  installs the previous version. So does the tag in the README's config
+  download (`raw.githubusercontent.com/.../vX.Y.Z/config/...`): on `main` or on
+  an older tag, a pip user gets a config that is not the one of the version
+  they installed. `tests/test_docs.py` fails on all three.
+- Docs: `python scripts/gen_llms_full.py` after ANY documentation change
+  (`--check` fails when stale). `llms-full.txt` is a concatenation and went
+  stale for three releases once; `llms.txt` and `docs/llms.txt` are the same
+  file and must stay identical.
+- Docker base: refresh the digest of `python:3.13-slim` in the Dockerfile
+  (`docker buildx imagetools inspect python:3.13-slim`) and move the date above
+  the FROM line, or the image ships months of Debian security fixes behind.
+  Dependabot no longer does it; `tests/test_docker_base.py` fails once a dated
+  release is more than 14 days past that check.
+- Benchmark: if you touched detection, re-run `privaite-bench`
+  (`python -m pbench.run` then `python -m pbench.report` from that repo root) and
+  update the README table (`tests/test_startup_warnings.py` reads the `onnx` and
+  `light` figures the light-preset warning quotes from it) and the presets table
+  in `docs/detection.md`. The published numbers must match the shipped code.
+- Release: `gh release create vX.Y.Z` triggers `publish.yml` → PyPI (trusted
+  publisher; its Environment field must stay empty). A PyPI version can never be
+  reused, so verify green CI first.
+
+## Recognizer vocabulary follows the language
+
+The recognizers PrivAiTe registers itself (`privaite/pii/recognizer_*.py`) are
+registered on **every** configured language, so any human-language word inside
+their regexes reaches text written in another language. A cue made of words
+belongs to the language those words come from: declare it in a
+`LanguagePatterns` map (`privaite/pii/recognizer_vocab.py`), never as a union of
+every language's vocabulary. Only patterns with no vocabulary at all (digits,
+punctuation, code identifiers) go in the `neutral` bucket that applies
+everywhere. Unioning them is how issue #31 happened, and the same shape then
+reported "configured via Terraform" as a location, `via` being an Italian
+street. Stop-word lists are the deliberate exception: they only ever shorten a
+match, so a union of languages there stays on the safe side.
+
+A cue that merely means "I am" ("je suis", "I'm", "ik ben") introduces an
+adjective as often as a name, so it requires a capitalised name; a cue that
+announces a name ("my name is") accepts any casing.
+
+These recognizers are also **exempt from the `entities` allowlist** by design,
+so removing a type from that list does not disable them: the knob is
+`pii.detectors.presidio.disabled_recognizers`, whose names are validated at
+config load. Anything reasoning about what Presidio can emit must call
+`builtin_recognizer_entity_types()` rather than restate the list.
+
+## Span boundaries give back structure, never a value
+
+`privaite/pii/boundaries.py` fits a detected span to the value it belongs to.
+`refine_boundary` runs on Presidio results and never drops anything;
+`refine_spans` runs on the model's spans, which on `.env` files run across
+lines, start inside a variable name or cover a fragment of one. A rule there
+may only give back characters that are structure by construction: an
+upper-case name assigned at the start of a line, the `:` and the last `@` of a
+URI userinfo, a line break before another assignment. "Start of a line"
+includes what agent tools put there (`ENV_LINE_PREFIX`: the line numbers of a
+file read, a diff marker, a compose list item, `export`), and the secret rules
+share that prefix: Claude Code sends a file it read as `12<tab>NAME=value`. When the structure is
+uncertain the span stays whole: lower-case names (`user=tag@example.com` is
+also one valid address), a name that looks like a token, a URI tail with a
+query string. A new rule needs a test for what it gives back and one for what
+it must leave covered. These rules run once per span, so a lookup never reads
+the whole line: a name is searched 512 characters back, a URI 2048 around the
+span, and beyond that the span stays whole. A minified file is one line with
+thousands of spans, and an unbounded lookup there took minutes.
+
+The structured secret rules feed the propagation of known credentials, so a
+false positive there is rewritten across the whole request: `TOKEN`, `SECRET`
+and `KEY` are trusted as names only upper-case at the start of a line with an
+opaque value, and a provider key format needs its prefix and its length.
+
+## The allow list is the one place a detection is given back
+
+`pii.allow_list` (`privaite/pii/allow_list.py`) is operator config, never
+request data: nothing in a message, header or tool output may widen it. It runs
+once, in `_detect_all_detailed`, after merging and before the cache, the
+propagation of known credentials, the block gate and the anonymizer, so every
+scanned surface sees the same result. A merged span is let through only when
+EVERY raw detection under it is listed on its own type and text, in full: a
+span that contains a listed value, or that another detector saw as something
+else, stays whole (the detections that stood in the way are reported as
+`not_allowed`, never acted on). Entries without `entity_types` never touch
+SECRET or a blocked type. The cache stores the let-through spans next to the
+redacted ones so `/v1/pii/inspect` stays exact on a hit; all of it value-free.
+A change here needs a test for what it lets through and one for what must stay
+covered, and the check that an empty list changes nothing.
+
+## Integrations must stay in sync with the core
+
+`integrations/litellm/privaite_guardrail.py` and
+`integrations/openwebui/privaite_filter.py` run the **same engine in-process**. Any
+core behavior change (fuzzy, block gate, a new restored/scanned field) must be
+mirrored in both.
+
+Each integration ships as ONE self-contained file (the filter is pasted verbatim
+onto the Open WebUI hub), so helpers they share exist as **copies**, not imports:
+`_restore_json_tree` and `_restore_arguments` today. The copies are the accepted
+price of that constraint, and the failure mode is real: a fix landing in one copy
+and not the other (it happened to the filter's declared privaite floor, which
+stayed behind while the file's content moved on). When you touch a shared helper
+or a mirrored behavior, apply it to BOTH files in the same change, then run
+`tests/test_integrations/test_parity.py`: it compares the copies' ASTs and fails
+on drift, and its `SHARED_HELPERS` list must grow when a new copied helper
+appears. If the change is deliberately one-sided, say why in the commit message.
+
+- OpenWebUI filter: `outlet` must **pop** the reversible map (Open WebUI may persist
+  message metadata); do not stash it when `deanonymize` is off; clear any
+  client-supplied incoming map in `inlet`.
+- LiteLLM guardrail: scan **every** Responses `input` item (role message, tool
+  output, tool-call arguments, `input_text` part, bare string), not just a
+  homogeneous list. Scan every leaf of `extra_body` too: LiteLLM merges it over
+  the request it sends, and `extra_body.messages` replaced the scrubbed messages
+  on the wire (its keys are provider specific, so no field list covers it).
+  With `block_entities` set, a prompt or input sent as token IDs is refused.
+  Every other top-level field is NOT scanned, and LiteLLM forwards a field it
+  does not know to the provider as it is: keep that stated in the README.
+- The guardrail also lives upstream in the fork `crp4222/litellm`, branch
+  `feat/privaite-guardrail` (PR #31530 to BerriAI/litellm). Sync fixes there too.
+  Fork PRs target BerriAI's default branch, `main` since `litellm_oss_staging` was
+  deleted (`gh api repos/BerriAI/litellm --jq .default_branch`; litellm's
+  `scripts/default_branch.py` reads `origin`, which in the fork clone is the fork).
+  The fork must pass litellm's gates: ruff-strict (`UP006` lowercase `list`, `C901`
+  complexity <=10, no net-new `Any`), type-discipline (`LIT007`: no
+  `TypeGuard`/`TypeIs`), line length 120, and `ui-api-types`: a change to the
+  guardrail's config model needs `python -m litellm.proxy._lazy_openapi_snapshot`
+  and `npm run gen:api` (in `ui/litellm-dashboard`), both files committed. Its
+  tests fake the `privaite` package because it is absent in litellm CI.
+
+## Verify, don't assume
+
+Reproduce a suspected bug before fixing it, and re-run the exact command the CI/gate
+runs (not a subset). For provider/streaming behavior, test against a real model
+through the local proxy (`python -m privaite --config <yaml>` then curl with
+`stream: true`); running with `deanonymization.enabled: false` proves the provider
+only ever received placeholders.

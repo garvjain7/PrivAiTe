@@ -1,0 +1,68 @@
+---
+description: >-
+  PrivAiTe API reference: OpenAI-compatible endpoints, exactly which request
+  fields are scanned or left untouched, strict mode, and passthrough caveats.
+---
+
+# API reference
+
+OpenAI-compatible:
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /v1/chat/completions` | Chat (streaming + non-streaming) |
+| `POST /v1/completions` | Text completions |
+| `POST /v1/embeddings` | Embeddings (anonymized, no de-anonymization) |
+| `POST /v1/pii/inspect` | Dry-run detection preview (off by default, see [verify.md](verify.md)) |
+| `GET /v1/models` | List configured models (in gateway mode, only for a caller holding a PrivAiTe key; anyone else is relayed to the Responses upstream, see [gateway](gateway.md)) |
+| `GET /health` | Liveness: the process answers (static, reads no state) |
+| `GET /ready` | Readiness: `200` when the proxy can serve, `503` when it cannot |
+| `GET /stats` | PII detection stats per session |
+
+With [gateway mode](gateway.md) enabled (opt-in, off by default), the agent CLI
+routes also exist: `POST /v1/messages` and `POST /v1/messages/count_tokens`
+(Anthropic Messages, for Claude Code) and `POST /v1/responses` (OpenAI
+Responses, for Codex, beta). They relay the client's own provider credentials
+and are not covered by `PRIVAITE_API_KEYS`; their scanned surface is documented
+on the [gateway page](gateway.md).
+
+## What gets anonymized
+
+Scanned before anything is forwarded to the provider:
+
+- `messages[].content`, whether a plain string or a multimodal list of parts (text parts are scrubbed, images and audio are left alone).
+- Plaintext `messages[].reasoning_content`, `messages[].reasoning`, `messages[].refusal` and `messages[].audio.transcript`, since 0.7.1. Clients can echo restored response fields on the next turn; these strings are scrubbed again. Other audio fields remain unchanged. The gateway's signed or encrypted reasoning blocks follow its separate [relay rules](gateway.md#what-is-scanned-and-what-is-not).
+- `tool_calls[].function.arguments` and the legacy `function_call.arguments`: parsed as JSON and scrubbed value by value, including numeric values (a card number sent as a bare JSON number is detected too; on a hit the leaf becomes the masked string). Object keys and the function name stay intact. Arguments that are not valid JSON are scrubbed as free text.
+- `/v1/completions` `prompt` and `/v1/embeddings` `input`, as a string or a list of strings.
+- Auxiliary request fields that carry user text: chat `prediction.content` (predicted outputs, string or text-part list) and `web_search_options.user_location`, plus the `/v1/completions` `suffix`. These are request inputs, scrubbed on the way in only.
+
+NOT scanned (know your surface): `messages[].name`, top-level fields like `user` and `metadata`, and `tools`/`functions` definitions are forwarded as-is; JSON object keys inside tool arguments are never rewritten (masking parameter names would break the tool schema); tokenized (integer-array) inputs are forwarded as-is too, since there is no text in them to inspect (`pii.strict: true` rejects them instead, see below). Keep PII out of those fields, or strip them upstream.
+
+Forwarded at all (since 0.7.3): the OpenAI parameters of each endpoint. Any other field is refused with a 400 `unsupported_parameter` before anything is scanned or sent, `api_base` and `extra_body` included (a field sent as `null` is dropped instead). An operator allows a provider-specific field with [`forward_params`](configuration.md#request-parameters).
+
+On the way back, the original values are restored in `message.content`, the reasoning trace, `message.refusal`, the audio `transcript`, and in returned `tool_calls` (including the legacy `function_call`), in both non-streaming and streaming responses. Set `pii.passthrough.tool_calls: true` to forward tool-call arguments unchanged.
+
+## Health and readiness
+
+`/health` is liveness only: a static `{"status": "ok"}` that reads no state, so
+it answers `ok` even when nothing works. Probe `/ready` instead (the Docker
+image's `HEALTHCHECK` does):
+
+```json
+{"ready": true, "checks": {"providers_configured": true, "pii_engine_ready": true},
+ "pii": "ready", "gateway_enabled": false}
+```
+
+It returns `503` unless the proxy can actually serve: a provider must be
+configured (or gateway mode enabled, which needs none), and the PII engine must
+be up. `pii` says which case you are in: `ready`, `initializing`, `missing` (PII
+is enabled but no engine is attached, so nothing would be scrubbed), or
+`disabled` (`pii.enabled: false`, an operator decision, which stays ready).
+
+## Strict mode
+
+For a stricter posture, set `pii.strict: true`: any request whose content can't be inspected (a shape that is neither text nor a known media part, e.g. tokenized `input` arrays) is rejected with `400` instead of being forwarded.
+
+## Passthrough caveat
+
+`passthrough.system_messages` and `passthrough.tool_calls` skip the engine entirely for those parts, which also skips `block_entities`. Both are `false` by default; do not enable them together with a block policy you rely on.

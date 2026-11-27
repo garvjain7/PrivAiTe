@@ -1,0 +1,181 @@
+server:
+  host: "0.0.0.0"
+  port: 8400
+  workers: 1
+  log_level: "info"
+
+auth:
+  enabled: true
+
+providers:
+  - model_name: "ministral"
+    litellm_params:
+      model: "ollama/ministral-fast:latest"
+      api_base: "http://host.docker.internal:11434"
+
+  - model_name: "ministral-3"
+    litellm_params:
+      model: "ollama/ministral-3:8b"
+      api_base: "http://host.docker.internal:11434"
+
+  # Cloud providers need their key in the environment. They are commented out
+  # so this file boots as-is (it is the Docker fallback config): a ${VAR} whose
+  # variable is unset fails startup on purpose.
+  # - model_name: "gpt-5.4-mini"
+  #   litellm_params:
+  #     model: "openai/gpt-5.4-mini"
+  #     api_key: "${OPENAI_API_KEY}"
+  #
+  # - model_name: "gpt-4o-mini"
+  #   litellm_params:
+  #     model: "openai/gpt-4o-mini"
+  #     api_key: "${OPENAI_API_KEY}"
+
+  - model_name: "kimi-k2"
+    litellm_params:
+      model: "ollama/kimi-k2.6:cloud"
+      api_base: "http://host.docker.internal:11434"
+
+  - model_name: "glm-5"
+    litellm_params:
+      model: "ollama/glm-5.3-flash:cloud"
+      api_base: "http://host.docker.internal:11434"
+
+# Agent CLI gateway (opt-in, off by default): native routes for Claude Code
+# (Anthropic Messages, validated live) and Codex (OpenAI Responses, beta).
+# Gateway routes relay the client's own provider credentials as-is; PrivAiTe
+# injects and validates no key there. Enable pii.detection_cache below for
+# agent sessions. See docs/gateway.md.
+# gateway:
+#   enabled: true
+#   anthropic:
+#     base_url: "https://api.anthropic.com/v1"
+#   openai_responses:                          # beta (Codex)
+#     base_url: "https://api.openai.com/v1"
+
+pii:
+  enabled: true
+  # Full ONNX suite (default): 72.7% of direct identifiers fully masked on
+  # privaite-bench, at a median 196 ms of in-process detection per benchmark
+  # document (README benchmark; that is detection time on one document, not
+  # end-to-end request latency, and it is hardware-dependent). Detects everything
+  # including secrets and passwords; downloads the ONNX model on first run. Use
+  # "light" for the fast Presidio-only path (44.8%, 60 ms per document on the same
+  # corpora). Do NOT pin detectors.presidio.entities below on the light path: it
+  # restricts detection to only those types.
+  # Opt-in, PrivAiTe's own model in place of the Privacy Filter (see the minilm
+  # block below): "minilm" (any platform, CPU) or "ultrafast" (macOS, Apple
+  # Neural Engine, pip install 'privaite[ane]'). Leave "onnx" to keep today's
+  # behavior.
+  preset: "onnx"
+
+  detectors:
+    presidio:
+      enabled: true
+      languages: ["fr", "en"]
+      score_threshold: 0.4
+      # entities: leave unset. The onnx preset automatically scopes Presidio to
+      # the types it is precise at (the ONNX model covers the rest). Only pin an
+      # allowlist for advanced tuning, and never on preset: "light".
+      # nlp_engine: "spacy"  # "blank": no spaCy model, faster, no spaCy NER
+      #                      # (the ultrafast preset's choice; names then come
+      #                      # from the model only)
+
+    # ONNX privacy-filter detector. This is what preset: "onnx" turns on (the
+    # default). The preset enables it automatically; uncomment to tune it.
+    # onnx:
+    #   enabled: true
+    #   model_name: "openai/privacy-filter"
+    #   revision: "7ffa9a043d54d1be65afb281eddf0ffbe629385b" # immutable HF commit
+    #   onnx_variant: "q4"        # or "q4f16" (fp16 compute, for GPU sessions)
+    #   device: "auto"            # auto, cpu, cuda, coreml/mps
+    #   score_threshold: 0.5
+
+    # PrivAiTe's own model. The minilm and ultrafast presets enable it; an
+    # explicit backend wins over the preset.
+    # minilm:
+    #   enabled: true
+    #   model_name: "crp4222/privaite-pii-minilm"
+    #   revision: "e7ea9dd38cd6d03198aeba57174a1d6d3a95618d" # immutable HF commit
+    #   backend: "onnx"           # onnx (fp32, CPU), onnx_int8 (CPU, 2x faster), coreml (Neural Engine)
+    #   score_threshold: 0.0
+    #   label_mapping: {...}      # drop a type to stop masking it
+
+    bert_ner:
+      enabled: false
+      model_name: "dslim/bert-base-NER"
+      revision: "d1a3e8f13f8c3566299d95fcfc9a8d2382a9affc"
+      device: "auto"
+      score_threshold: 0.5
+
+    mlmodel:
+      enabled: false
+      model_name: "openai/privacy-filter"
+      revision: "7ffa9a043d54d1be65afb281eddf0ffbe629385b"
+      device: "auto"
+      torch_dtype: "float16"
+      score_threshold: 0.5
+
+    # The max preset enables this automatically. Requires: pip install 'privaite[gliner]'.
+    gliner:
+      enabled: false
+      model_name: "urchade/gliner_multi_pii-v1"
+      revision: "1fcf13e85f4eef5394e1fcd406cf2ca9ea82351d"
+
+  merge_strategy: "union"
+  overlap_resolution: "highest_score"
+  on_error: "block"
+
+  # Hard policy gate: PII types listed here cause the WHOLE request to be
+  # rejected (HTTP 400) instead of being pseudonymized. Empty by default, so
+  # every detected type is masked and forwarded as usual. Opt-in per type.
+  block_entities: []
+  # block_entities: ["US_SSN", "CREDIT_CARD"]
+
+  anonymization:
+    method: "placeholder"
+    faker_locale: ["fr_FR", "en_US"]
+    # Per-type overrides of the method above. BOTH are irreversible on purpose:
+    # a masked card and a redacted secret never enter the reversible map, so they
+    # are NOT restored in the reply (the provider sees "****************" or
+    # "[SECRET]" and so do you). Every other type keeps the reversible
+    # "placeholder" method and does come back. Delete this block, or set these
+    # types to "placeholder", if you would rather have them restored.
+    # Documented at docs/configuration.md#entity-overrides-per-type-methods.
+    entity_overrides:
+      CREDIT_CARD:
+        method: "mask"
+        masking_char: "*"
+      SECRET:
+        method: "redact"
+
+  deanonymization:
+    enabled: true
+    # Opt-in: also restore placeholders the model re-typed imperfectly (small
+    # wrong-substitution risk on lookalike spans).
+    fuzzy_matching: false
+    fuzzy_threshold: 0.85
+
+  # Detection cache for clients that resend the whole conversation every turn
+  # (agent CLIs: Claude Code, Codex). Caches merged detection spans per exact
+  # text leaf: salted hashes and span metadata only, never text or PII values.
+  # Off by default; enabling it lets PII-derived metadata live in process
+  # memory up to ttl_seconds after a request ends. See the README threat model.
+  detection_cache:
+    enabled: false
+    max_entries: 4096
+    ttl_seconds: 1800
+
+  # Dry-run inspection endpoint (POST /v1/pii/inspect): returns the detections
+  # for a text you submit, without forwarding anything to any provider and
+  # without logging any value. For testing what gets redacted. Off by default.
+  inspect:
+    enabled: false
+
+  passthrough:
+    system_messages: false
+    tool_calls: false
+
+logging:
+  format: "json"
+  level: "info"
